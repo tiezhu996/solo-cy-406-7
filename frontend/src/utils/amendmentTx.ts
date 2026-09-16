@@ -4,7 +4,16 @@ import { ContractInstance } from '../types/contract-instance';
 import { ContractParty, ContractStatus } from '../types/enums';
 import { Version } from '../types/version';
 import { makeId, nowIso } from './db';
-import { AmendmentError, AmendmentErrorCode, applyCredentialAction, buildCredentialHashes, createAmendment, isTerminal, markApplied } from './amendmentMachine';
+import {
+  ALL_PARTIES,
+  AmendmentError,
+  AmendmentErrorCode,
+  applyCredentialAction,
+  buildCredentialHashes,
+  createAmendment,
+  isTerminal,
+  markApplied
+} from './amendmentMachine';
 import { hashCredential, issueCredentialPair, parseCredentialParty, timingSafeEqual } from './amendmentCredential';
 
 /**
@@ -30,9 +39,16 @@ export function serializeForInstance<T>(contractInstanceId: string, task: () => 
   return current;
 }
 
-/** 凭据不被承认：格式错误（CREDENTIAL_MALFORMED）或哈希不符（CREDENTIAL_MISMATCH） */
+/** 凭据校验阶段可能出现的原因码 */
+export type CredentialRejectionCode =
+  | 'CREDENTIAL_MALFORMED'
+  | 'CREDENTIAL_BOUND_ELSEWHERE'
+  | 'CREDENTIAL_UNRECOGNIZED'
+  | 'CREDENTIAL_UNAVAILABLE';
+
+/** 凭据不被承认：格式错误 / 绑定其他变更 / 无法识别 / 暂时无法验证 */
 export class CredentialVerificationError extends AmendmentError {
-  constructor(message: string, code: 'CREDENTIAL_MALFORMED' | 'CREDENTIAL_MISMATCH') {
+  constructor(message: string, code: CredentialRejectionCode) {
     super(message, code);
     this.name = 'CredentialVerificationError';
   }
@@ -56,6 +72,56 @@ function asPersistenceFailure(error: unknown): AmendmentError {
     return error;
   }
   return new PersistenceFailureError('变更落库失败，事务已回滚：合同正文、变更记录和版本号均未改变', error);
+}
+
+/** 只需 getAll 的最小 store 结构（事务内 objectStore 天然满足） */
+interface AmendmentReader {
+  getAll(): Promise<unknown[]>;
+}
+
+/**
+ * 当前变更槽位与凭据哈希不匹配时，在【同一事务内】扫描全部变更做归属反查：
+ * - 命中其他变更的任一方槽位 → CREDENTIAL_BOUND_ELSEWHERE（跨变更复用）；
+ * - 全部变更均未命中         → CREDENTIAL_UNRECOGNIZED（凭据无法识别）；
+ * - 反查本身查询失败         → CREDENTIAL_UNAVAILABLE（暂时无法验证）。
+ *
+ * 该函数只读取数据、不执行写入；三种结果都保持正文、记录、版本不变。
+ */
+async function resolveCredentialMismatch(
+  amendmentStore: AmendmentReader,
+  current: Amendment,
+  tokenHash: string
+): Promise<CredentialVerificationError> {
+  let all: Amendment[];
+  try {
+    all = (await amendmentStore.getAll()) as Amendment[];
+  } catch {
+    return new CredentialVerificationError(
+      '凭据暂时无法验证：查询变更记录失败，请稍后重试；本次操作未生效，合同正文、记录和版本均未改变',
+      'CREDENTIAL_UNAVAILABLE'
+    );
+  }
+
+  const boundElsewhere = all.find(
+    (item) =>
+      item.id !== current.id &&
+      ALL_PARTIES.some((party) => {
+        const slot = item.credentials?.[party];
+        return slot ? timingSafeEqual(slot.tokenHash, tokenHash) : false;
+      })
+  );
+
+  if (boundElsewhere) {
+    return new CredentialVerificationError(
+      `该凭据已被另一条变更「${boundElsewhere.title}」绑定，不能用于本变更（凭据不可跨变更复用）；本次操作未生效`,
+      'CREDENTIAL_BOUND_ELSEWHERE'
+    );
+  }
+
+  return new CredentialVerificationError(
+    '凭据无法识别：与任何变更登记时分发的凭据都不匹配（可能输入有误、属于他方凭据或已失效），本次操作未生效',
+    'CREDENTIAL_UNRECOGNIZED'
+  );
 }
 
 export interface RegisterResult {
@@ -203,15 +269,10 @@ export async function respondAmendmentTx(
       // —— 验票：当事方由票据前缀决定（锁外已解析），哈希必须与库内槽位一致 ——
       const party = partyFromToken;
       const slot = amendment.credentials[party];
-      if (!slot) {
-        throw new CredentialVerificationError('凭据校验失败：该凭据不属于本变更的任何一方', 'CREDENTIAL_MISMATCH');
-      }
-      if (!timingSafeEqual(tokenHash, slot.tokenHash)) {
-        // 跨变更复用、他方票据、伪造或篡改都落在这里
-        throw new CredentialVerificationError(
-          '凭据校验失败：与本变更登记时分发的凭据不匹配（可能是跨变更复用、他方凭据或输入有误），本次操作未生效',
-          'CREDENTIAL_MISMATCH'
-        );
+      if (!slot || !timingSafeEqual(tokenHash, slot.tokenHash)) {
+        // 哈希与本变更不符：在同一事务内反查全部变更归属，区分
+        // 「已被另一变更绑定 / 无法识别 / 暂时无法验证」
+        throw await resolveCredentialMismatch(amendmentStore, amendment, tokenHash);
       }
 
       const now = nowIso();

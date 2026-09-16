@@ -31,10 +31,25 @@ export function describeRejection(reason: AmendmentErrorCode, message: string, a
   switch (reason) {
     case 'CREDENTIAL_MALFORMED':
       return { tone: 'error', inline: `凭据格式错误：${message}。变更仍为待确认，合同正文和版本未改变。` };
+    case 'CREDENTIAL_BOUND_ELSEWHERE':
+      return {
+        tone: 'error',
+        inline: `${message}。合同正文、变更记录和版本均未改变，请改用本变更登记时分发给本方的凭据。`
+      };
+    case 'CREDENTIAL_UNRECOGNIZED':
+      return {
+        tone: 'error',
+        inline: `${message}。合同正文、变更记录和版本均未改变，请核对凭据后重试。`
+      };
+    case 'CREDENTIAL_UNAVAILABLE':
+      return {
+        tone: 'warning',
+        inline: `${message}。请稍后用同一枚合法凭据重试，凭据未被消耗。`
+      };
     case 'CREDENTIAL_MISMATCH':
       return {
         tone: 'error',
-        inline: `凭据不被接受（跨变更复用、他方凭据或内容有误），${verb}未执行。变更记录、正文和版本均未改变，请使用本变更登记时分发给本方的凭据重试。`
+        inline: `凭据不被接受，${verb}未执行。变更记录、正文和版本均未改变，请使用本变更登记时分发给本方的凭据重试。`
       };
     case 'CREDENTIAL_USED':
       return { tone: 'info', inline: '该凭据已使用过，不能再次生效；状态保持不变。' };

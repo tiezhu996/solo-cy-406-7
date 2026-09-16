@@ -16,7 +16,10 @@ export type AmendmentErrorCode =
   | 'PENDING_EXISTS' // 同一合同已有在途变更
   | 'TERMINAL_STATE' // 变更已生效/已撤回，操作不再有效
   | 'CREDENTIAL_MALFORMED' // 凭据格式错误
-  | 'CREDENTIAL_MISMATCH' // 凭据哈希不符：跨变更复用、他方票据、伪造或篡改
+  | 'CREDENTIAL_MISMATCH' // 与当前变更槽位不符（进入反查前的兜底）
+  | 'CREDENTIAL_BOUND_ELSEWHERE' // 哈希反查命中另一变更：凭据已被另一条变更绑定，不能跨变更复用
+  | 'CREDENTIAL_UNRECOGNIZED' // 哈希在全部变更中均未命中：凭据无法识别
+  | 'CREDENTIAL_UNAVAILABLE' // 反查过程中查询失败：暂时无法验证凭据，本次操作未生效
   | 'CREDENTIAL_USED' // 凭据已使用（正常路径走 ignored，此码为状态机防线）
   | 'PERSISTENCE_FAILED' // 落库/事务提交失败，已整体回滚
   | 'ILLEGAL_STATE'; // 不应出现的内部前置条件违反

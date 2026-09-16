@@ -268,32 +268,27 @@ test('凭据安全：格式错误、哈希不符、跨变更复用一律拒绝�
   const inst = await seedSignedContract(db);
   const { amendment, tokenA, tokenB } = await registerHelper(db, inst);
 
-  // 另起一条变更（先撤回第一条给第二份合同用，这里直接用第二份合同）
+  // 另起一条变更（第二份合同），用于验证「跨变更复用」的独立分类
   const inst2 = await seedSignedContract(db, signedInstance());
   const second = await registerHelper(db, inst2);
 
-  const badInputs = [
-    'not-a-token',
-    `amd-a_${'0'.repeat(32)}`, // 前缀合法但秘密错误
-    tokenA.slice(0, -1) + (tokenA.endsWith('a') ? 'b' : 'a'), // 末位篡改
-    second.tokenA, // 跨变更复用
-    tokenB.replace('amd-b_', 'amd-a_') // 换前缀冒充甲方
+  // 输入 → 预期原因码
+  const badInputs: Array<[string, string]> = [
+    ['not-a-token', 'CREDENTIAL_MALFORMED'],
+    [`amd-a_${'0'.repeat(32)}`, 'CREDENTIAL_UNRECOGNIZED'], // 格式合法但全库无此哈希
+    [tokenA.slice(0, -1) + (tokenA.endsWith('a') ? 'b' : 'a'), 'CREDENTIAL_UNRECOGNIZED'], // 末位篡改
+    [second.tokenA, 'CREDENTIAL_BOUND_ELSEWHERE'], // 命中另一变更
+    [tokenB.replace('amd-b_', 'amd-a_'), 'CREDENTIAL_UNRECOGNIZED'] // 换前缀：冒充方槽位无匹配，原哈希也不落在任何甲槽
   ];
 
-  for (const bad of badInputs) {
-    const expected = bad === 'not-a-token' ? 'CREDENTIAL_MALFORMED' : 'CREDENTIAL_MISMATCH';
-    await assert.rejects(
-      async () => {
-        try {
-          await confirmA(db, amendment.id, bad);
-        } catch (error) {
-          assert.equal((error as AmendmentError).code, expected, `错票应归类为 ${expected}: ${bad}`);
-          throw error;
-        }
-      },
-      CredentialVerificationError,
-      `应收下错票: ${bad}`
-    );
+  for (const [bad, expected] of badInputs) {
+    try {
+      await confirmA(db, amendment.id, bad);
+      assert.fail(`本应拒绝: ${bad}`);
+    } catch (error) {
+      assert.ok(error instanceof CredentialVerificationError, `应为凭据校验错误: ${bad}`);
+      assert.equal((error as AmendmentError).code, expected, `错票归类: ${bad}`);
+    }
   }
 
   // 全部拒绝后仍停留在待确认、无确认落库
@@ -309,6 +304,104 @@ test('凭据安全：格式错误、哈希不符、跨变更复用一律拒绝�
   assert.equal(ok.applied, false);
   assert.equal(ok.party, ContractParty.PartyA);
 });
+
+test('凭据安全：反查命中另一变更的乙方槽位也判为 BIND_ELSEWHERE，且不影响两条变更', async () => {
+  await resetDb();
+  const db = await openFreshDb();
+  const inst1 = await seedSignedContract(db, signedInstance());
+  const first = await registerHelper(db, inst1);
+  const inst2 = await seedSignedContract(db, signedInstance());
+  const second = await registerHelper(db, inst2);
+
+  // 用第二条变更的乙方凭据去操作第一条变更
+  const error = await confirmA(db, first.amendment.id, second.tokenB).then(() => null, (e: unknown) => e);
+  assert.ok(error instanceof CredentialVerificationError);
+  assert.equal((error as AmendmentError).code, 'CREDENTIAL_BOUND_ELSEWHERE');
+  assert.match((error as Error).message, /另一条变更/);
+
+  // 两条变更都仍在待确认，且都没有凭据被消耗
+  for (const item of [first.amendment, second.amendment]) {
+    const record = (await db.get('amendments', item.id)) as Amendment;
+    assert.equal(record.status, AmendmentStatus.Pending);
+    assert.equal(record.credentials[ContractParty.PartyA].used, false);
+    assert.equal(record.credentials[ContractParty.PartyB].used, false);
+  }
+
+  // 凭据仍可用于其真正归属的变更，完成双方确认
+  await respondAmendmentTx(db, { amendmentId: second.amendment.id, token: second.tokenA, action: 'confirm' });
+  const done = await respondAmendmentTx(db, { amendmentId: second.amendment.id, token: second.tokenB, action: 'confirm' });
+  assert.equal(done.applied, true);
+});
+
+test('凭据安全：反查查询失败归类 UNAVAILABLE，不改状态且凭据仍可用', async () => {
+  await resetDb();
+  const db = await openFreshDb();
+  const inst = await seedSignedContract(db);
+  const { amendment, tokenA, tokenB } = await registerHelper(db, inst);
+
+  // 让 readwrite 事务内 amendments.getAll（归属反查）抛错
+  const failingDb = proxyAmendmentGetAllFailure(db, new Error('cursor unavailable'));
+  // 用一个格式合法但与本变更不符的凭据，强制走到反查分支
+  const foreign = `amd-a_${'f'.repeat(32)}`;
+  const error = await respondAmendmentTx(failingDb as IDBPDatabase, {
+    amendmentId: amendment.id,
+    token: foreign,
+    action: 'confirm'
+  }).then(() => null, (e: unknown) => e);
+
+  assert.ok(error instanceof CredentialVerificationError);
+  assert.equal((error as AmendmentError).code, 'CREDENTIAL_UNAVAILABLE');
+
+  const amdAfter = (await db.get('amendments', amendment.id)) as Amendment;
+  assert.equal(amdAfter.status, AmendmentStatus.Pending);
+  assert.equal((await db.get('instances', inst.id) as ContractInstance).finalHtml, V1_HTML);
+  assert.deepEqual(await db.getAllFromIndex('versions', 'byInstance', inst.id), []);
+
+  // 合法凭据仍可继续完成确认
+  await respondAmendmentTx(db, { amendmentId: amendment.id, token: tokenA, action: 'confirm' });
+  const done = await respondAmendmentTx(db, { amendmentId: amendment.id, token: tokenB, action: 'confirm' });
+  assert.equal(done.applied, true);
+});
+
+/** 让 readwrite 事务内 amendments.getAll 抛错（模拟反查查询失败），其余透传 */
+function proxyAmendmentGetAllFailure(db: IDBPDatabase, failure: Error): unknown {
+  return new Proxy(db, {
+    get(target, prop, receiver) {
+      if (prop !== 'transaction') {
+        return Reflect.get(target, prop, receiver);
+      }
+      return (...args: unknown[]) => {
+        const tx = Reflect.apply(target.transaction, target, args);
+        if (tx.mode !== 'readwrite') {
+          return tx;
+        }
+        return new Proxy(tx, {
+          get(txTarget: any, txProp, txReceiver) {
+            if (txProp !== 'objectStore') {
+              const value = Reflect.get(txTarget, txProp, txReceiver);
+              return typeof value === 'function' ? value.bind(txTarget) : value;
+            }
+            return (name: string) => {
+              const store = Reflect.apply(txTarget.objectStore, txTarget, [name]);
+              if (name !== 'amendments') {
+                return store;
+              }
+              return new Proxy(store, {
+                get(storeTarget: any, storeProp) {
+                  const value = Reflect.get(storeTarget, storeProp);
+                  if (storeProp === 'getAll') {
+                    return () => Promise.reject(failure);
+                  }
+                  return typeof value === 'function' ? value.bind(storeTarget) : value;
+                }
+              });
+            };
+          }
+        });
+      };
+    }
+  });
+}
 
 test('凭据安全：同一凭据第二次提交不产生任何效果（幂等忽略，无写入无版本）', async () => {
   await resetDb();

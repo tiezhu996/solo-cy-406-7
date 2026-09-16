@@ -279,10 +279,25 @@ function describeRejection(reason, message, action) {
   switch (reason) {
     case "CREDENTIAL_MALFORMED":
       return { tone: "error", inline: `\u51ED\u636E\u683C\u5F0F\u9519\u8BEF\uFF1A${message}\u3002\u53D8\u66F4\u4ECD\u4E3A\u5F85\u786E\u8BA4\uFF0C\u5408\u540C\u6B63\u6587\u548C\u7248\u672C\u672A\u6539\u53D8\u3002` };
+    case "CREDENTIAL_BOUND_ELSEWHERE":
+      return {
+        tone: "error",
+        inline: `${message}\u3002\u5408\u540C\u6B63\u6587\u3001\u53D8\u66F4\u8BB0\u5F55\u548C\u7248\u672C\u5747\u672A\u6539\u53D8\uFF0C\u8BF7\u6539\u7528\u672C\u53D8\u66F4\u767B\u8BB0\u65F6\u5206\u53D1\u7ED9\u672C\u65B9\u7684\u51ED\u636E\u3002`
+      };
+    case "CREDENTIAL_UNRECOGNIZED":
+      return {
+        tone: "error",
+        inline: `${message}\u3002\u5408\u540C\u6B63\u6587\u3001\u53D8\u66F4\u8BB0\u5F55\u548C\u7248\u672C\u5747\u672A\u6539\u53D8\uFF0C\u8BF7\u6838\u5BF9\u51ED\u636E\u540E\u91CD\u8BD5\u3002`
+      };
+    case "CREDENTIAL_UNAVAILABLE":
+      return {
+        tone: "warning",
+        inline: `${message}\u3002\u8BF7\u7A0D\u540E\u7528\u540C\u4E00\u679A\u5408\u6CD5\u51ED\u636E\u91CD\u8BD5\uFF0C\u51ED\u636E\u672A\u88AB\u6D88\u8017\u3002`
+      };
     case "CREDENTIAL_MISMATCH":
       return {
         tone: "error",
-        inline: `\u51ED\u636E\u4E0D\u88AB\u63A5\u53D7\uFF08\u8DE8\u53D8\u66F4\u590D\u7528\u3001\u4ED6\u65B9\u51ED\u636E\u6216\u5185\u5BB9\u6709\u8BEF\uFF09\uFF0C${verb}\u672A\u6267\u884C\u3002\u53D8\u66F4\u8BB0\u5F55\u3001\u6B63\u6587\u548C\u7248\u672C\u5747\u672A\u6539\u53D8\uFF0C\u8BF7\u4F7F\u7528\u672C\u53D8\u66F4\u767B\u8BB0\u65F6\u5206\u53D1\u7ED9\u672C\u65B9\u7684\u51ED\u636E\u91CD\u8BD5\u3002`
+        inline: `\u51ED\u636E\u4E0D\u88AB\u63A5\u53D7\uFF0C${verb}\u672A\u6267\u884C\u3002\u53D8\u66F4\u8BB0\u5F55\u3001\u6B63\u6587\u548C\u7248\u672C\u5747\u672A\u6539\u53D8\uFF0C\u8BF7\u4F7F\u7528\u672C\u53D8\u66F4\u767B\u8BB0\u65F6\u5206\u53D1\u7ED9\u672C\u65B9\u7684\u51ED\u636E\u91CD\u8BD5\u3002`
       };
     case "CREDENTIAL_USED":
       return { tone: "info", inline: "\u8BE5\u51ED\u636E\u5DF2\u4F7F\u7528\u8FC7\uFF0C\u4E0D\u80FD\u518D\u6B21\u751F\u6548\uFF1B\u72B6\u6001\u4FDD\u6301\u4E0D\u53D8\u3002" };
@@ -401,6 +416,33 @@ function asPersistenceFailure(error) {
   }
   return new PersistenceFailureError("\u53D8\u66F4\u843D\u5E93\u5931\u8D25\uFF0C\u4E8B\u52A1\u5DF2\u56DE\u6EDA\uFF1A\u5408\u540C\u6B63\u6587\u3001\u53D8\u66F4\u8BB0\u5F55\u548C\u7248\u672C\u53F7\u5747\u672A\u6539\u53D8", error);
 }
+async function resolveCredentialMismatch(amendmentStore, current, tokenHash) {
+  let all;
+  try {
+    all = await amendmentStore.getAll();
+  } catch {
+    return new CredentialVerificationError(
+      "\u51ED\u636E\u6682\u65F6\u65E0\u6CD5\u9A8C\u8BC1\uFF1A\u67E5\u8BE2\u53D8\u66F4\u8BB0\u5F55\u5931\u8D25\uFF0C\u8BF7\u7A0D\u540E\u91CD\u8BD5\uFF1B\u672C\u6B21\u64CD\u4F5C\u672A\u751F\u6548\uFF0C\u5408\u540C\u6B63\u6587\u3001\u8BB0\u5F55\u548C\u7248\u672C\u5747\u672A\u6539\u53D8",
+      "CREDENTIAL_UNAVAILABLE"
+    );
+  }
+  const boundElsewhere = all.find(
+    (item) => item.id !== current.id && ALL_PARTIES.some((party) => {
+      const slot = item.credentials?.[party];
+      return slot ? timingSafeEqual(slot.tokenHash, tokenHash) : false;
+    })
+  );
+  if (boundElsewhere) {
+    return new CredentialVerificationError(
+      `\u8BE5\u51ED\u636E\u5DF2\u88AB\u53E6\u4E00\u6761\u53D8\u66F4\u300C${boundElsewhere.title}\u300D\u7ED1\u5B9A\uFF0C\u4E0D\u80FD\u7528\u4E8E\u672C\u53D8\u66F4\uFF08\u51ED\u636E\u4E0D\u53EF\u8DE8\u53D8\u66F4\u590D\u7528\uFF09\uFF1B\u672C\u6B21\u64CD\u4F5C\u672A\u751F\u6548`,
+      "CREDENTIAL_BOUND_ELSEWHERE"
+    );
+  }
+  return new CredentialVerificationError(
+    "\u51ED\u636E\u65E0\u6CD5\u8BC6\u522B\uFF1A\u4E0E\u4EFB\u4F55\u53D8\u66F4\u767B\u8BB0\u65F6\u5206\u53D1\u7684\u51ED\u636E\u90FD\u4E0D\u5339\u914D\uFF08\u53EF\u80FD\u8F93\u5165\u6709\u8BEF\u3001\u5C5E\u4E8E\u4ED6\u65B9\u51ED\u636E\u6216\u5DF2\u5931\u6548\uFF09\uFF0C\u672C\u6B21\u64CD\u4F5C\u672A\u751F\u6548",
+    "CREDENTIAL_UNRECOGNIZED"
+  );
+}
 function assertSigned(instance, contractInstanceId) {
   if (!instance) {
     throw new AmendmentError("\u5408\u540C\u5B9E\u4F8B\u4E0D\u5B58\u5728\uFF0C\u65E0\u6CD5\u767B\u8BB0\u53D8\u66F4", "NOT_FOUND");
@@ -486,14 +528,8 @@ async function respondAmendmentTx(db, params) {
       }
       const party = partyFromToken;
       const slot = amendment.credentials[party];
-      if (!slot) {
-        throw new CredentialVerificationError("\u51ED\u636E\u6821\u9A8C\u5931\u8D25\uFF1A\u8BE5\u51ED\u636E\u4E0D\u5C5E\u4E8E\u672C\u53D8\u66F4\u7684\u4EFB\u4F55\u4E00\u65B9", "CREDENTIAL_MISMATCH");
-      }
-      if (!timingSafeEqual(tokenHash, slot.tokenHash)) {
-        throw new CredentialVerificationError(
-          "\u51ED\u636E\u6821\u9A8C\u5931\u8D25\uFF1A\u4E0E\u672C\u53D8\u66F4\u767B\u8BB0\u65F6\u5206\u53D1\u7684\u51ED\u636E\u4E0D\u5339\u914D\uFF08\u53EF\u80FD\u662F\u8DE8\u53D8\u66F4\u590D\u7528\u3001\u4ED6\u65B9\u51ED\u636E\u6216\u8F93\u5165\u6709\u8BEF\uFF09\uFF0C\u672C\u6B21\u64CD\u4F5C\u672A\u751F\u6548",
-          "CREDENTIAL_MISMATCH"
-        );
+      if (!slot || !timingSafeEqual(tokenHash, slot.tokenHash)) {
+        throw await resolveCredentialMismatch(amendmentStore, amendment, tokenHash);
       }
       const now = nowIso();
       if (slot.used) {
@@ -759,30 +795,24 @@ test("\u51ED\u636E\u5B89\u5168\uFF1A\u683C\u5F0F\u9519\u8BEF\u3001\u54C8\u5E0C\u
   const inst2 = await seedSignedContract(db, signedInstance());
   const second = await registerHelper(db, inst2);
   const badInputs = [
-    "not-a-token",
-    `amd-a_${"0".repeat(32)}`,
-    // 前缀合法但秘密错误
-    tokenA.slice(0, -1) + (tokenA.endsWith("a") ? "b" : "a"),
+    ["not-a-token", "CREDENTIAL_MALFORMED"],
+    [`amd-a_${"0".repeat(32)}`, "CREDENTIAL_UNRECOGNIZED"],
+    // 格式合法但全库无此哈希
+    [tokenA.slice(0, -1) + (tokenA.endsWith("a") ? "b" : "a"), "CREDENTIAL_UNRECOGNIZED"],
     // 末位篡改
-    second.tokenA,
-    // 跨变更复用
-    tokenB.replace("amd-b_", "amd-a_")
-    // 换前缀冒充甲方
+    [second.tokenA, "CREDENTIAL_BOUND_ELSEWHERE"],
+    // 命中另一变更
+    [tokenB.replace("amd-b_", "amd-a_"), "CREDENTIAL_UNRECOGNIZED"]
+    // 换前缀：冒充方槽位无匹配，原哈希也不落在任何甲槽
   ];
-  for (const bad of badInputs) {
-    const expected = bad === "not-a-token" ? "CREDENTIAL_MALFORMED" : "CREDENTIAL_MISMATCH";
-    await assert.rejects(
-      async () => {
-        try {
-          await confirmA(db, amendment.id, bad);
-        } catch (error) {
-          assert.equal(error.code, expected, `\u9519\u7968\u5E94\u5F52\u7C7B\u4E3A ${expected}: ${bad}`);
-          throw error;
-        }
-      },
-      CredentialVerificationError,
-      `\u5E94\u6536\u4E0B\u9519\u7968: ${bad}`
-    );
+  for (const [bad, expected] of badInputs) {
+    try {
+      await confirmA(db, amendment.id, bad);
+      assert.fail(`\u672C\u5E94\u62D2\u7EDD: ${bad}`);
+    } catch (error) {
+      assert.ok(error instanceof CredentialVerificationError, `\u5E94\u4E3A\u51ED\u636E\u6821\u9A8C\u9519\u8BEF: ${bad}`);
+      assert.equal(error.code, expected, `\u9519\u7968\u5F52\u7C7B: ${bad}`);
+    }
   }
   const amdAfter = await db.get("amendments", amendment.id);
   assert.equal(amdAfter.status, "pending" /* Pending */);
@@ -794,6 +824,87 @@ test("\u51ED\u636E\u5B89\u5168\uFF1A\u683C\u5F0F\u9519\u8BEF\u3001\u54C8\u5E0C\u
   assert.equal(ok.applied, false);
   assert.equal(ok.party, "partyA" /* PartyA */);
 });
+test("\u51ED\u636E\u5B89\u5168\uFF1A\u53CD\u67E5\u547D\u4E2D\u53E6\u4E00\u53D8\u66F4\u7684\u4E59\u65B9\u69FD\u4F4D\u4E5F\u5224\u4E3A BIND_ELSEWHERE\uFF0C\u4E14\u4E0D\u5F71\u54CD\u4E24\u6761\u53D8\u66F4", async () => {
+  await resetDb();
+  const db = await openFreshDb();
+  const inst1 = await seedSignedContract(db, signedInstance());
+  const first = await registerHelper(db, inst1);
+  const inst2 = await seedSignedContract(db, signedInstance());
+  const second = await registerHelper(db, inst2);
+  const error = await confirmA(db, first.amendment.id, second.tokenB).then(() => null, (e) => e);
+  assert.ok(error instanceof CredentialVerificationError);
+  assert.equal(error.code, "CREDENTIAL_BOUND_ELSEWHERE");
+  assert.match(error.message, /另一条变更/);
+  for (const item of [first.amendment, second.amendment]) {
+    const record = await db.get("amendments", item.id);
+    assert.equal(record.status, "pending" /* Pending */);
+    assert.equal(record.credentials["partyA" /* PartyA */].used, false);
+    assert.equal(record.credentials["partyB" /* PartyB */].used, false);
+  }
+  await respondAmendmentTx(db, { amendmentId: second.amendment.id, token: second.tokenA, action: "confirm" });
+  const done = await respondAmendmentTx(db, { amendmentId: second.amendment.id, token: second.tokenB, action: "confirm" });
+  assert.equal(done.applied, true);
+});
+test("\u51ED\u636E\u5B89\u5168\uFF1A\u53CD\u67E5\u67E5\u8BE2\u5931\u8D25\u5F52\u7C7B UNAVAILABLE\uFF0C\u4E0D\u6539\u72B6\u6001\u4E14\u51ED\u636E\u4ECD\u53EF\u7528", async () => {
+  await resetDb();
+  const db = await openFreshDb();
+  const inst = await seedSignedContract(db);
+  const { amendment, tokenA, tokenB } = await registerHelper(db, inst);
+  const failingDb = proxyAmendmentGetAllFailure(db, new Error("cursor unavailable"));
+  const foreign = `amd-a_${"f".repeat(32)}`;
+  const error = await respondAmendmentTx(failingDb, {
+    amendmentId: amendment.id,
+    token: foreign,
+    action: "confirm"
+  }).then(() => null, (e) => e);
+  assert.ok(error instanceof CredentialVerificationError);
+  assert.equal(error.code, "CREDENTIAL_UNAVAILABLE");
+  const amdAfter = await db.get("amendments", amendment.id);
+  assert.equal(amdAfter.status, "pending" /* Pending */);
+  assert.equal((await db.get("instances", inst.id)).finalHtml, V1_HTML);
+  assert.deepEqual(await db.getAllFromIndex("versions", "byInstance", inst.id), []);
+  await respondAmendmentTx(db, { amendmentId: amendment.id, token: tokenA, action: "confirm" });
+  const done = await respondAmendmentTx(db, { amendmentId: amendment.id, token: tokenB, action: "confirm" });
+  assert.equal(done.applied, true);
+});
+function proxyAmendmentGetAllFailure(db, failure) {
+  return new Proxy(db, {
+    get(target, prop, receiver) {
+      if (prop !== "transaction") {
+        return Reflect.get(target, prop, receiver);
+      }
+      return (...args) => {
+        const tx = Reflect.apply(target.transaction, target, args);
+        if (tx.mode !== "readwrite") {
+          return tx;
+        }
+        return new Proxy(tx, {
+          get(txTarget, txProp, txReceiver) {
+            if (txProp !== "objectStore") {
+              const value = Reflect.get(txTarget, txProp, txReceiver);
+              return typeof value === "function" ? value.bind(txTarget) : value;
+            }
+            return (name) => {
+              const store = Reflect.apply(txTarget.objectStore, txTarget, [name]);
+              if (name !== "amendments") {
+                return store;
+              }
+              return new Proxy(store, {
+                get(storeTarget, storeProp) {
+                  const value = Reflect.get(storeTarget, storeProp);
+                  if (storeProp === "getAll") {
+                    return () => Promise.reject(failure);
+                  }
+                  return typeof value === "function" ? value.bind(storeTarget) : value;
+                }
+              });
+            };
+          }
+        });
+      };
+    }
+  });
+}
 test("\u51ED\u636E\u5B89\u5168\uFF1A\u540C\u4E00\u51ED\u636E\u7B2C\u4E8C\u6B21\u63D0\u4EA4\u4E0D\u4EA7\u751F\u4EFB\u4F55\u6548\u679C\uFF08\u5E42\u7B49\u5FFD\u7565\uFF0C\u65E0\u5199\u5165\u65E0\u7248\u672C\uFF09", async () => {
   await resetDb();
   const db = await openFreshDb();
