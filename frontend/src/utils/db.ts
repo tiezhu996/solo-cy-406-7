@@ -1,4 +1,4 @@
-import { openDB, IDBPDatabase } from 'idb';
+import { openDB, IDBPDatabase, IDBPObjectStore } from 'idb';
 import { Amendment } from '../types/amendment';
 import { Clause } from '../types/clause';
 import { ContractInstance } from '../types/contract-instance';
@@ -10,8 +10,10 @@ export const DB_NAME = 'contract-template-editor';
  * v1: templates / clauses / instances / versions
  * v2: 新增 amendments（合同变更记录），并为 versions 增加 byInstance 索引，
  *     供变更生效事务在同一事务内查询当前最大版本号。
+ * v3: amendments 改为一次性凭据驱动：以 credentials(哈希槽) 取代自报身份；
+ *     迁移时规范化历史记录（终态补占位槽，旧待确认记录作废）。
  */
-export const DB_VERSION = 2;
+export const DB_VERSION = 3;
 
 export const STORE_NAMES = ['templates', 'clauses', 'instances', 'versions', 'amendments'] as const;
 export type StoreName = (typeof STORE_NAMES)[number];
@@ -67,8 +69,25 @@ export function openAppDb(): Promise<IDBPDatabase> {
           versions.createIndex('byInstance', 'contractInstanceId');
         }
       }
+
+      // v2 -> v3：amendments 升级为一次性凭据模型，规范化历史记录。
+      // 返回 Promise 时 idb 会等待其 resolve 后才提交升级事务。
+      if (oldVersion >= 2 && oldVersion < 3 && db.objectStoreNames.contains('amendments')) {
+        return migrateAmendmentsV2ToV3(transaction.objectStore('amendments'));
+      }
     }
   });
+}
+
+async function migrateAmendmentsV2ToV3(store: IDBPObjectStore<unknown, string[], 'amendments', 'versionchange'>) {
+  const { migrateAmendmentV2ToV3 } = await import('./amendmentMigrate');
+  let cursor = await store.openCursor();
+  const migratedAt = nowIso();
+  while (cursor) {
+    const migrated = migrateAmendmentV2ToV3(cursor.value as Record<string, unknown>, migratedAt);
+    cursor.update(migrated);
+    cursor = await cursor.continue();
+  }
 }
 
 export function getDb() {

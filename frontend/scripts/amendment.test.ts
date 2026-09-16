@@ -2,17 +2,24 @@ import 'fake-indexeddb/auto';
 import test, { after } from 'node:test';
 import assert from 'node:assert/strict';
 import { IDBPDatabase } from 'idb';
-import { getDb, makeId, nowIso, openAppDb, STORE_NAMES, DB_VERSION, DB_NAME } from '../src/utils/db';
+import { DB_NAME, DB_VERSION, getDb, makeId, openAppDb, STORE_NAMES } from '../src/utils/db';
 import {
   AmendmentError,
+  applyCredentialAction,
   bothConfirmed,
-  confirmAmendment,
+  buildCredentialHashes,
   createAmendment,
   markApplied,
-  withdrawAmendment
+  partyConfirmed
 } from '../src/utils/amendmentMachine';
-import { registerAmendmentTx, respondAmendmentTx, serializeForInstance } from '../src/utils/amendmentTx';
-import { Amendment, AmendmentStatus } from '../src/types/amendment';
+import {
+  CredentialVerificationError,
+  registerAmendmentTx,
+  respondAmendmentTx,
+  serializeForInstance
+} from '../src/utils/amendmentTx';
+import { hashCredential, issueCredentialPair, parseCredentialParty } from '../src/utils/amendmentCredential';
+import { Amendment, AmendmentStatus, IssuedCredential } from '../src/types/amendment';
 import { ContractParty, ContractStatus } from '../src/types/enums';
 import { ContractInstance } from '../src/types/contract-instance';
 import { Version } from '../src/types/version';
@@ -44,24 +51,23 @@ function signedInstance(id = makeId('inst')): ContractInstance {
   };
 }
 
+const openDbs: IDBPDatabase[] = [];
+
 async function resetDb() {
   for (const db of openDbs.splice(0)) {
     db.close();
   }
   await new Promise<void>((resolve, reject) => {
-    const req = indexedDB.deleteDatabase('contract-template-editor');
+    const req = indexedDB.deleteDatabase(DB_NAME);
     req.onsuccess = () => resolve();
     req.onerror = () => reject(req.error);
     req.onblocked = () => reject(new Error('deleteDatabase 被阻塞'));
   });
 }
 
-const openDbs: IDBPDatabase[] = [];
-
 async function openFreshDb(version?: number): Promise<IDBPDatabase> {
-  // 通过动态 import 重新拿一份干净模块成本高；这里直接用 openDB 复刻 schema
   const { openDB } = await import('idb');
-  const db = await openDB('contract-template-editor', version ?? DB_VERSION, {
+  const db = await openDB(DB_NAME, version ?? DB_VERSION, {
     upgrade(db, oldVersion, _n, transaction) {
       for (const name of STORE_NAMES) {
         if (!db.objectStoreNames.contains(name)) {
@@ -89,97 +95,150 @@ async function seedSignedContract(db: IDBPDatabase, instance?: ContractInstance)
   return inst;
 }
 
-// ---------- 纯函数状态机 ----------
+async function registerHelper(db: IDBPDatabase, inst: ContractInstance) {
+  const result = await registerAmendmentTx(db, {
+    contractInstanceId: inst.id,
+    content: { title: '变更1', reason: '协商一致', proposedHtml: V2_HTML },
+    proposedBy: ContractParty.PartyA
+  });
+  const tokenA = result.credentials.find((c) => c.party === ContractParty.PartyA)!.token;
+  const tokenB = result.credentials.find((c) => c.party === ContractParty.PartyB)!.token;
+  return { amendment: result.amendment, tokenA, tokenB };
+}
 
-test('状态机：登记后停在待确认，原合同不受影响', () => {
+const confirmA = (db: IDBPDatabase, amendmentId: string, token: string) =>
+  respondAmendmentTx(db, { amendmentId, token, action: 'confirm' });
+const confirmB = (db: IDBPDatabase, amendmentId: string, token: string) =>
+  respondAmendmentTx(db, { amendmentId, token, action: 'confirm' });
+const withdraw = (db: IDBPDatabase, amendmentId: string, token: string) =>
+  respondAmendmentTx(db, { amendmentId, token, action: 'withdraw' });
+
+// ---------- 凭据工具与纯函数状态机 ----------
+
+test('凭据：甲、乙凭据不同；前缀决定当事方', () => {
+  const issued = issueCredentialPair();
+  const a = issued.find((c) => c.party === ContractParty.PartyA)!;
+  const b = issued.find((c) => c.party === ContractParty.PartyB)!;
+  assert.notEqual(a.token, b.token);
+  assert.match(a.token, /^amd-a_[0-9a-f]{32}$/);
+  assert.match(b.token, /^amd-b_[0-9a-f]{32}$/);
+  assert.equal(parseCredentialParty(a.token), ContractParty.PartyA);
+  assert.equal(parseCredentialParty(b.token), ContractParty.PartyB);
+  assert.equal(parseCredentialParty('amd-a_short'), null);
+  assert.equal(parseCredentialParty('totally-wrong'), null);
+  assert.equal(parseCredentialParty(' amd-b_' + '1'.repeat(32) + ' '), ContractParty.PartyB);
+});
+
+test('状态机：登记只落哈希槽，明文不出现在记录里', async () => {
+  const issued: IssuedCredential[] = issueCredentialPair();
   const amd = createAmendment({
     id: 'amd_1',
     contractInstanceId: 'inst_1',
-    content: { title: 't', reason: 'r', proposedHtml: V2_HTML },
+    content: { title: 't', reason: '', proposedHtml: V2_HTML },
     proposedBy: ContractParty.PartyA,
+    credentialHashes: await buildCredentialHashes(issued),
     now: NOW
   });
-  assert.equal(amd.status, AmendmentStatus.Pending);
-  assert.deepEqual(amd.confirmedParties, []);
+
+  const serialized = JSON.stringify(amd);
+  for (const credential of issued) {
+    assert.ok(!serialized.includes(credential.token), '明文凭据不得落库');
+    const hash = await hashCredential(credential.token);
+    const slot = amd.credentials[credential.party];
+    assert.equal(slot.tokenHash, hash);
+    assert.equal(slot.used, false);
+  }
   assert.equal(bothConfirmed(amd), false);
 });
 
-test('状态机：同一方重复确认幂等，不产生新效果', () => {
+test('状态机：双方各凭各的票确认一次才 ready，票互不通用', async () => {
+  const issued = issueCredentialPair();
   let amd = createAmendment({
     id: 'amd_1',
     contractInstanceId: 'inst_1',
     content: { title: 't', reason: '', proposedHtml: V2_HTML },
     proposedBy: ContractParty.PartyA,
+    credentialHashes: await buildCredentialHashes(issued),
     now: NOW
   });
-  const first = confirmAmendment(amd, ContractParty.PartyA, NOW);
-  assert.equal(first.ready, false);
-  assert.deepEqual(first.amendment.confirmedParties, [ContractParty.PartyA]);
 
-  const second = confirmAmendment(first.amendment, ContractParty.PartyA, NOW);
-  assert.equal(second.ignored, true);
-  assert.equal(second.ready, false);
-  assert.deepEqual(second.amendment.confirmedParties, [ContractParty.PartyA]);
-  amd = second.amendment;
+  const r1 = applyCredentialAction(amd, ContractParty.PartyA, 'confirm', NOW);
+  assert.equal(r1.ready, false);
+  assert.equal(partyConfirmed(r1.amendment, ContractParty.PartyA), true);
+  assert.equal(partyConfirmed(r1.amendment, ContractParty.PartyB), false);
+  amd = r1.amendment;
 
-  // 另一方确认一次即齐备
-  const third = confirmAmendment(amd, ContractParty.PartyB, NOW);
-  assert.equal(third.ready, true);
-  assert.equal(third.ignored, false);
+  // 状态机层面凭据消费一次后即终态：同方再确认会被状态迁移的一次性前提拦住
+  assert.throws(() => applyCredentialAction(amd, ContractParty.PartyA, 'confirm', NOW), AmendmentError);
+
+  const r2 = applyCredentialAction(amd, ContractParty.PartyB, 'confirm', NOW);
+  assert.equal(r2.ready, true);
+  assert.equal(bothConfirmed(r2.amendment), true);
 });
 
-test('状态机：任一方撤回整条失效，终态后确认/撤回被拒绝', () => {
+test('状态机：任一方凭票撤回整条失效；终态动作被拒', async () => {
+  const issued = issueCredentialPair();
   let amd = createAmendment({
     id: 'amd_1',
     contractInstanceId: 'inst_1',
     content: { title: 't', reason: '', proposedHtml: V2_HTML },
     proposedBy: ContractParty.PartyA,
+    credentialHashes: await buildCredentialHashes(issued),
     now: NOW
   });
-  amd = confirmAmendment(amd, ContractParty.PartyA, NOW).amendment;
-  amd = withdrawAmendment(amd, ContractParty.PartyB, NOW);
+  amd = applyCredentialAction(amd, ContractParty.PartyA, 'confirm', NOW).amendment;
+  amd = applyCredentialAction(amd, ContractParty.PartyB, 'withdraw', NOW).amendment;
   assert.equal(amd.status, AmendmentStatus.Withdrawn);
   assert.equal(amd.withdrawnBy, ContractParty.PartyB);
-
-  assert.throws(() => confirmAmendment(amd, ContractParty.PartyB, NOW), AmendmentError);
-  // 重复撤回保持幂等
-  assert.equal(withdrawAmendment(amd, ContractParty.PartyA, NOW).status, AmendmentStatus.Withdrawn);
+  assert.equal(amd.credentials[ContractParty.PartyB].usedFor, 'withdraw');
+  assert.throws(() => applyCredentialAction(amd, ContractParty.PartyB, 'confirm', NOW), AmendmentError);
 });
 
-test('状态机：已生效变更不能撤回', () => {
+test('状态机：双方齐备后才能 markApplied，否则拒绝', async () => {
+  const issued = issueCredentialPair();
   let amd = createAmendment({
     id: 'amd_1',
     contractInstanceId: 'inst_1',
     content: { title: 't', reason: '', proposedHtml: V2_HTML },
     proposedBy: ContractParty.PartyA,
+    credentialHashes: await buildCredentialHashes(issued),
     now: NOW
   });
-  amd = confirmAmendment(amd, ContractParty.PartyA, NOW).amendment;
-  amd = confirmAmendment(amd, ContractParty.PartyB, NOW).amendment;
-  amd = markApplied(amd, 'ver_2', 1, NOW);
-  assert.equal(amd.status, AmendmentStatus.Applied);
-  assert.throws(() => withdrawAmendment(amd, ContractParty.PartyA, NOW), AmendmentError);
+  amd = applyCredentialAction(amd, ContractParty.PartyA, 'confirm', NOW).amendment;
+
+  assert.throws(() => markApplied(amd, 'ver_2', 1, NOW), AmendmentError, '单方确认不能生效');
+
+  amd = applyCredentialAction(amd, ContractParty.PartyB, 'confirm', NOW).amendment;
+  const applied = markApplied(amd, 'ver_2', 1, NOW);
+  assert.equal(applied.status, AmendmentStatus.Applied);
+  assert.equal(applied.appliedVersionId, 'ver_2');
+  assert.throws(() => markApplied(applied, 'ver_3', 2, NOW), AmendmentError, '已生效不能重复落位');
 });
 
-// ---------- 真实 IndexedDB 事务 ----------
+// ---------- 真实 IndexedDB 事务：登记 ----------
 
-test('事务：登记仅已签署合同允许，登记时不动正文/版本', async () => {
+test('事务：登记返回双方一次性凭据；正文/版本不变；明文不进库', async () => {
   await resetDb();
   const db = await openFreshDb();
   const inst = await seedSignedContract(db);
 
-  const amd = await registerAmendmentTx(db, {
+  const result = await registerAmendmentTx(db, {
     contractInstanceId: inst.id,
-    content: { title: '变更1', reason: '协商', proposedHtml: V2_HTML },
+    content: { title: '变更1', reason: '', proposedHtml: V2_HTML },
     proposedBy: ContractParty.PartyA
   });
-  assert.equal(amd.status, AmendmentStatus.Pending);
+  assert.equal(result.credentials.length, 2);
+  assert.notEqual(result.credentials[0].token, result.credentials[1].token);
 
-  const instAfter = (await db.get('instances', inst.id)) as ContractInstance;
-  assert.equal(instAfter.finalHtml, V1_HTML);
+  const raw = (await db.get('amendments', result.amendment.id)) as Amendment;
+  const rawText = JSON.stringify(raw);
+  for (const credential of result.credentials) {
+    assert.ok(!rawText.includes(credential.token));
+  }
+  assert.equal((await db.get('instances', inst.id)).finalHtml, V1_HTML);
   assert.deepEqual(await db.getAll('versions'), []);
 
-  // 非已签署合同不能登记
+  // 非已签署合同不能登记；同一合同在途只能有一条
   const draft = signedInstance();
   draft.status = ContractStatus.Draft;
   await db.put('instances', draft);
@@ -191,8 +250,6 @@ test('事务：登记仅已签署合同允许，登记时不动正文/版本', a
     }),
     AmendmentError
   );
-
-  // 同一合同已有待确认变更时不能再登记（唯一入口 = 单条在途）
   await assert.rejects(
     registerAmendmentTx(db, {
       contractInstanceId: inst.id,
@@ -203,207 +260,214 @@ test('事务：登记仅已签署合同允许，登记时不动正文/版本', a
   );
 });
 
-test('事务：双方确认同事务生成新版本、替换正文、推进变更记录', async () => {
+// ---------- 错票 / 跨变更 / 已用 ----------
+
+test('凭据安全：格式错误、哈希不符、跨变更复用一律拒绝，状态/正文/版本不变', async () => {
   await resetDb();
   const db = await openFreshDb();
   const inst = await seedSignedContract(db);
-  const amd = await registerAmendmentTx(db, {
-    contractInstanceId: inst.id,
-    content: { title: '变更1', reason: '', proposedHtml: V2_HTML },
-    proposedBy: ContractParty.PartyA
-  });
+  const { amendment, tokenA, tokenB } = await registerHelper(db, inst);
 
-  const afterA = await respondAmendmentTx(db, { amendmentId: amd.id, party: ContractParty.PartyA, action: 'confirm' });
-  assert.equal(afterA.applied, false);
-  assert.equal((await db.get('instances', inst.id)).finalHtml, V1_HTML, '单方确认后正文不变');
-  assert.deepEqual(await db.getAll('versions'), [], '单方确认不生成版本');
+  // 另起一条变更（先撤回第一条给第二份合同用，这里直接用第二份合同）
+  const inst2 = await seedSignedContract(db, signedInstance());
+  const second = await registerHelper(db, inst2);
 
-  const afterB = await respondAmendmentTx(db, { amendmentId: amd.id, party: ContractParty.PartyB, action: 'confirm' });
-  assert.equal(afterB.applied, true);
+  const badInputs = [
+    'not-a-token',
+    `amd-a_${'0'.repeat(32)}`, // 前缀合法但秘密错误
+    tokenA.slice(0, -1) + (tokenA.endsWith('a') ? 'b' : 'a'), // 末位篡改
+    second.tokenA, // 跨变更复用
+    tokenB.replace('amd-b_', 'amd-a_') // 换前缀冒充甲方
+  ];
 
-  const instAfter = (await db.get('instances', inst.id)) as ContractInstance;
-  const versions = (await db.getAll('versions')) as Version[];
-  const amdAfter = (await db.get('amendments', amd.id)) as Amendment;
+  for (const bad of badInputs) {
+    await assert.rejects(confirmA(db, amendment.id, bad), CredentialVerificationError, `应收下错票: ${bad}`);
+  }
 
-  assert.equal(instAfter.finalHtml, V2_HTML, '正文替换');
-  assert.equal(versions.length, 1);
-  assert.equal(versions[0].versionNo, 1);
-  assert.equal(versions[0].contentSnapshot, V2_HTML);
-  assert.equal(instAfter.versionIds.includes(versions[0].id), true);
-  assert.equal(amdAfter.status, AmendmentStatus.Applied);
-  assert.equal(amdAfter.appliedVersionId, versions[0].id);
+  // 全部拒绝后仍停留在待确认、无确认落库
+  const amdAfter = (await db.get('amendments', amendment.id)) as Amendment;
+  assert.equal(amdAfter.status, AmendmentStatus.Pending);
+  assert.equal(amdAfter.credentials[ContractParty.PartyA].used, false);
+  assert.equal(amdAfter.credentials[ContractParty.PartyB].used, false);
+  assert.equal((await db.get('instances', inst.id)).finalHtml, V1_HTML);
+  assert.deepEqual(await db.getAllFromIndex('versions', 'byInstance', inst.id), []);
+
+  // 真实凭据仍然可用，说明拒绝没有污染状态
+  const ok = await confirmA(db, amendment.id, tokenA);
+  assert.equal(ok.applied, false);
+  assert.equal(ok.party, ContractParty.PartyA);
 });
 
-test('事务：同一方重复确认不重复生效（不产生版本）', async () => {
+test('凭据安全：同一凭据第二次提交不产生任何效果（幂等忽略，无写入无版本）', async () => {
   await resetDb();
   const db = await openFreshDb();
   const inst = await seedSignedContract(db);
-  const amd = await registerAmendmentTx(db, {
-    contractInstanceId: inst.id,
-    content: { title: '变更1', reason: '', proposedHtml: V2_HTML },
-    proposedBy: ContractParty.PartyA
-  });
+  const { amendment, tokenA } = await registerHelper(db, inst);
 
-  await respondAmendmentTx(db, { amendmentId: amd.id, party: ContractParty.PartyA, action: 'confirm' });
-  const repeat = await respondAmendmentTx(db, { amendmentId: amd.id, party: ContractParty.PartyA, action: 'confirm' });
+  const first = await confirmA(db, amendment.id, tokenA);
+  assert.equal(first.applied, false);
+  const firstRecord = (await db.get('amendments', amendment.id)) as Amendment;
+  assert.equal(firstRecord.credentials[ContractParty.PartyA].used, true);
+
+  // 第二次提交同一枚凭据：ignored，且不产生新的 updatedAt / timeline
+  const repeat = await confirmA(db, amendment.id, tokenA);
+  assert.equal(repeat.ignored, true);
   assert.equal(repeat.applied, false);
-  assert.equal(repeat.amendment.confirmedParties.length, 1);
-  assert.deepEqual(await db.getAll('versions'), []);
-  assert.equal((await db.get('instances', inst.id)).finalHtml, V1_HTML);
+  const secondRecord = (await db.get('amendments', amendment.id)) as Amendment;
+  assert.equal(secondRecord.updatedAt, firstRecord.updatedAt);
+  assert.equal(secondRecord.timeline.length, firstRecord.timeline.length);
 
-  // 终态后确认直接报错
-  await respondAmendmentTx(db, { amendmentId: amd.id, party: ContractParty.PartyB, action: 'confirm' });
-  await assert.rejects(
-    respondAmendmentTx(db, { amendmentId: amd.id, party: ContractParty.PartyA, action: 'confirm' }),
-    AmendmentError
-  );
+  // 单人仅持甲方票，无论提交多少次都不能生效
+  await confirmA(db, amendment.id, tokenA);
+  await confirmA(db, amendment.id, tokenA);
+  assert.deepEqual(await db.getAllFromIndex('versions', 'byInstance', inst.id), []);
+  assert.equal(((await db.get('amendments', amendment.id)) as Amendment).status, AmendmentStatus.Pending);
 });
 
-test('事务：任一方撤回整条失效，正文与版本不变', async () => {
+test('凭据安全：持票撤回一次性；撤回后凭据再用无效；另一票确认被拒', async () => {
   await resetDb();
   const db = await openFreshDb();
   const inst = await seedSignedContract(db);
-  const amd = await registerAmendmentTx(db, {
-    contractInstanceId: inst.id,
-    content: { title: '变更1', reason: '', proposedHtml: V2_HTML },
-    proposedBy: ContractParty.PartyA
-  });
-  await respondAmendmentTx(db, { amendmentId: amd.id, party: ContractParty.PartyA, action: 'confirm' });
-  const withdrawn = await respondAmendmentTx(db, { amendmentId: amd.id, party: ContractParty.PartyB, action: 'withdraw' });
+  const { amendment, tokenA, tokenB } = await registerHelper(db, inst);
 
-  assert.equal(withdrawn.amendment.status, AmendmentStatus.Withdrawn);
+  await confirmA(db, amendment.id, tokenA);
+  const w = await withdraw(db, amendment.id, tokenB);
+  assert.equal(w.amendment.status, AmendmentStatus.Withdrawn);
+  assert.equal(w.amendment.credentials[ContractParty.PartyB].usedFor, 'withdraw');
+
+  // 撤回后同一凭据再提交：终态拒绝，状态不变
+  await assert.rejects(withdraw(db, amendment.id, tokenB), AmendmentError);
+  await assert.rejects(confirmB(db, amendment.id, tokenB), AmendmentError);
+  // 甲方票也无法让已撤回的变更复活
+  await assert.rejects(confirmA(db, amendment.id, tokenA), AmendmentError);
+
   assert.equal((await db.get('instances', inst.id)).finalHtml, V1_HTML);
-  assert.deepEqual(await db.getAll('versions'), []);
-  const amdAfter = await db.get('amendments', amd.id);
-  assert.equal(amdAfter.status, 'withdrawn');
-
-  // 撤回后再确认无效
-  await assert.rejects(
-    respondAmendmentTx(db, { amendmentId: amd.id, party: ContractParty.PartyB, action: 'confirm' }),
-    AmendmentError
-  );
+  assert.deepEqual(await db.getAllFromIndex('versions', 'byInstance', inst.id), []);
 });
 
-test('并发：确认与撤回同时到达，只落地一个，状态一致', async () => {
+test('正常流程：双方各凭合法票确认一次后，同事务生成新版本并替换正文', async () => {
   await resetDb();
   const db = await openFreshDb();
   const inst = await seedSignedContract(db);
-  const amd = await registerAmendmentTx(db, {
-    contractInstanceId: inst.id,
-    content: { title: '变更1', reason: '', proposedHtml: V2_HTML },
-    proposedBy: ContractParty.PartyA
-  });
+  const { amendment, tokenA, tokenB } = await registerHelper(db, inst);
 
-  // 甲方确认（已登记为甲方发起但未确认）与乙方撤回同时发出
-  const [confirmResult, withdrawResult] = await Promise.allSettled([
-    respondAmendmentTx(db, { amendmentId: amd.id, party: ContractParty.PartyA, action: 'confirm' }),
-    respondAmendmentTx(db, { amendmentId: amd.id, party: ContractParty.PartyB, action: 'withdraw' })
-  ]);
+  const a = await confirmA(db, amendment.id, tokenA);
+  assert.equal(a.applied, false);
+  assert.equal((await db.get('instances', inst.id)).finalHtml, V1_HTML);
 
-  const amdAfter = (await db.get('amendments', amd.id)) as Amendment;
-  const versions = await db.getAll('versions');
+  const b = await confirmB(db, amendment.id, tokenB);
+  assert.equal(b.applied, true);
+  assert.equal(b.party, ContractParty.PartyB);
+
   const instAfter = (await db.get('instances', inst.id)) as ContractInstance;
-
-  if (amdAfter.status === AmendmentStatus.Withdrawn) {
-    // 撤回先落地时，另一方确认必须被拒绝；确认先落地时，撤回随后仍把整条置为失效
-    if (confirmResult.status === 'rejected') {
-      assert.equal(withdrawResult.status, 'fulfilled');
-    }
-  }
-  // 无论顺序如何，都不能出现「已撤回但正文被替换/版本已生成」
-  assert.equal(versions.length, 0);
-  assert.equal(instAfter.finalHtml, V1_HTML);
-  assert.equal(amdAfter.status, AmendmentStatus.Withdrawn);
-});
-
-test('并发：双方确认与撤回赛跑，永远不会出现已撤回却已生效', async () => {
-  await resetDb();
-  const db = await openFreshDb();
-
-  for (let round = 0; round < 8; round++) {
-    const inst = await seedSignedContract(db, signedInstance(`inst_race_${round}`));
-    const amd = await registerAmendmentTx(db, {
-      contractInstanceId: inst.id,
-      content: { title: 't', reason: '', proposedHtml: V2_HTML },
-      proposedBy: ContractParty.PartyA
-    });
-
-    await Promise.allSettled([
-      respondAmendmentTx(db, { amendmentId: amd.id, party: ContractParty.PartyA, action: 'confirm' }),
-      respondAmendmentTx(db, { amendmentId: amd.id, party: ContractParty.PartyB, action: 'confirm' }),
-      respondAmendmentTx(db, { amendmentId: amd.id, party: ContractParty.PartyA, action: 'withdraw' })
-    ]);
-
-    const amdAfter = (await db.get('amendments', amd.id)) as Amendment;
-    const versions = (await db.getAllFromIndex('versions', 'byInstance', inst.id)) as Version[];
-    const instAfter = (await db.get('instances', inst.id)) as ContractInstance;
-
-    if (amdAfter.status === AmendmentStatus.Applied) {
-      assert.equal(versions.length, 1, '生效必须恰好伴随一个新版本');
-      assert.equal(instAfter.finalHtml, V2_HTML);
-      assert.equal(amdAfter.appliedVersionId, versions[0].id);
-    } else {
-      assert.equal(amdAfter.status, AmendmentStatus.Withdrawn);
-      assert.equal(versions.length, 0, '撤回后不得有版本');
-      assert.equal(instAfter.finalHtml, V1_HTML, '撤回后正文必须保持原样');
-    }
-  }
-});
-
-test('回滚：生成新版本途中失败时，正文/变更记录/版本号一起不变', async () => {
-  await resetDb();
-  const base = await openFreshDb();
-  const inst = await seedSignedContract(base);
-  const amd = await registerAmendmentTx(base, {
-    contractInstanceId: inst.id,
-    content: { title: '变更1', reason: '', proposedHtml: V2_HTML },
-    proposedBy: ContractParty.PartyA
-  });
-  await respondAmendmentTx(base, { amendmentId: amd.id, party: ContractParty.PartyA, action: 'confirm' });
-
-  // 故障注入：删掉合同实例，使事务内「替换正文」前置读取失败。
-  // 该读发生在 versions/amendments 写入之前还是之后都无所谓——同一事务 abort 时全部回滚。
-  await base.delete('instances', inst.id);
-
-  await assert.rejects(
-    respondAmendmentTx(base, { amendmentId: amd.id, party: ContractParty.PartyB, action: 'confirm' }),
-    AmendmentError
-  );
-
-  const amdAfter = (await base.get('amendments', amd.id)) as Amendment;
-  const versions = await base.getAll('versions');
-  assert.equal(amdAfter.status, AmendmentStatus.Pending, '变更记录回滚为待确认');
-  assert.deepEqual(amdAfter.confirmedParties, [ContractParty.PartyA], '第二方确认不落库');
-  assert.deepEqual(versions, [], '不允许残留版本（版本号不变）');
-});
-
-test('回读：事务提交后重新打开数据库，结果一致', async () => {
-  await resetDb();
-  const db = await openFreshDb();
-  const inst = await seedSignedContract(db);
-  const amd = await registerAmendmentTx(db, {
-    contractInstanceId: inst.id,
-    content: { title: '变更1', reason: '', proposedHtml: V2_HTML },
-    proposedBy: ContractParty.PartyA
-  });
-  await respondAmendmentTx(db, { amendmentId: amd.id, party: ContractParty.PartyA, action: 'confirm' });
-  await respondAmendmentTx(db, { amendmentId: amd.id, party: ContractParty.PartyB, action: 'confirm' });
-  db.close();
-
-  // 模拟刷新：用全新连接回读
-  const reopened = await openFreshDb();
-  const instAfter = (await reopened.get('instances', inst.id)) as ContractInstance;
-  const versions = (await reopened.getAllFromIndex('versions', 'byInstance', inst.id)) as Version[];
-  const amdAfter = (await reopened.get('amendments', amd.id)) as Amendment;
+  const versions = (await db.getAllFromIndex('versions', 'byInstance', inst.id)) as Version[];
+  const amdAfter = (await db.get('amendments', amendment.id)) as Amendment;
 
   assert.equal(instAfter.finalHtml, V2_HTML);
   assert.equal(versions.length, 1);
   assert.equal(versions[0].versionNo, 1);
+  assert.equal(instAfter.versionIds.includes(versions[0].id), true);
+  assert.equal(amdAfter.status, AmendmentStatus.Applied);
+  assert.equal(amdAfter.appliedVersionId, versions[0].id);
+  assert.equal(amdAfter.credentials[ContractParty.PartyA].usedFor, 'confirm');
+  assert.equal(amdAfter.credentials[ContractParty.PartyB].usedFor, 'confirm');
+
+  // 生效后任何凭据再提交都被拒绝，不会产生 v2 号段之外的版本
+  await assert.rejects(confirmA(db, amendment.id, tokenA), AmendmentError);
+  const versionsAfter = await db.getAllFromIndex('versions', 'byInstance', inst.id);
+  assert.equal(versionsAfter.length, 1);
+});
+
+test('并发：两票确认与一票撤回赛跑，永远不会出现已撤回却已生效', async () => {
+  await resetDb();
+  const db = await openFreshDb();
+
+  for (let round = 0; round < 8; round += 1) {
+    const inst = await seedSignedContract(db, signedInstance(`inst_race_${round}`));
+    const { amendment, tokenA, tokenB } = await registerHelper(db, inst);
+
+    await Promise.allSettled([
+      confirmA(db, amendment.id, tokenA),
+      confirmB(db, amendment.id, tokenB),
+      withdraw(db, amendment.id, tokenA)
+    ]);
+
+    const amdAfter = (await db.get('amendments', amendment.id)) as Amendment;
+    const versions = (await db.getAllFromIndex('versions', 'byInstance', inst.id)) as Version[];
+    const instAfter = (await db.get('instances', inst.id)) as ContractInstance;
+
+    if (amdAfter.status === AmendmentStatus.Applied) {
+      assert.equal(versions.length, 1);
+      assert.equal(instAfter.finalHtml, V2_HTML);
+      assert.equal(amdAfter.appliedVersionId, versions[0].id);
+    } else {
+      assert.equal(amdAfter.status, AmendmentStatus.Withdrawn);
+      assert.equal(versions.length, 0);
+      assert.equal(instAfter.finalHtml, V1_HTML);
+    }
+  }
+});
+
+test('并发：同一枚票同时提交两次，只产生一次效果', async () => {
+  await resetDb();
+  const db = await openFreshDb();
+  const inst = await seedSignedContract(db);
+  const { amendment, tokenA, tokenB } = await registerHelper(db, inst);
+
+  const [r1, r2] = await Promise.all([confirmA(db, amendment.id, tokenA), confirmA(db, amendment.id, tokenA)]);
+  const outcomes = [r1, r2];
+  assert.equal(outcomes.filter((r) => r.ignored).length, 1, '恰好一次有效，一次忽略');
+
+  const amdAfter = (await db.get('amendments', amendment.id)) as Amendment;
+  assert.equal(amdAfter.status, AmendmentStatus.Pending);
+  assert.equal(amdAfter.credentials[ContractParty.PartyA].used, true);
+  assert.equal(amdAfter.credentials[ContractParty.PartyB].used, false);
+  assert.deepEqual(await db.getAllFromIndex('versions', 'byInstance', inst.id), []);
+
+  // 乙方票照常可以补齐双方确认
+  const done = await confirmB(db, amendment.id, tokenB);
+  assert.equal(done.applied, true);
+});
+
+test('回滚：双方确认齐备但落库失败时，正文/变更记录/版本号一起不变', async () => {
+  await resetDb();
+  const db = await openFreshDb();
+  const inst = await seedSignedContract(db);
+  const { amendment, tokenA, tokenB } = await registerHelper(db, inst);
+  await confirmA(db, amendment.id, tokenA);
+
+  // 故障注入：删掉合同实例，使事务内「替换正文」前置读取失败 → 整个事务 abort
+  await db.delete('instances', inst.id);
+  await assert.rejects(confirmB(db, amendment.id, tokenB), AmendmentError);
+
+  const amdAfter = (await db.get('amendments', amendment.id)) as Amendment;
+  assert.equal(amdAfter.status, AmendmentStatus.Pending);
+  assert.equal(amdAfter.credentials[ContractParty.PartyA].used, true);
+  assert.equal(amdAfter.credentials[ContractParty.PartyB].used, false, '乙方确认不落库');
+  assert.deepEqual(await db.getAll('versions'), []);
+});
+
+test('回读：生效后重开数据库，凭据状态/正文/版本一致', async () => {
+  await resetDb();
+  const db = await openFreshDb();
+  const inst = await seedSignedContract(db);
+  const { amendment, tokenA, tokenB } = await registerHelper(db, inst);
+  await confirmA(db, amendment.id, tokenA);
+  await confirmB(db, amendment.id, tokenB);
+  db.close();
+
+  const reopened = await openFreshDb();
+  const instAfter = (await reopened.get('instances', inst.id)) as ContractInstance;
+  const versions = (await reopened.getAllFromIndex('versions', 'byInstance', inst.id)) as Version[];
+  const amdAfter = (await reopened.get('amendments', amendment.id)) as Amendment;
+
+  assert.equal(instAfter.finalHtml, V2_HTML);
+  assert.equal(versions.length, 1);
   assert.equal(amdAfter.status, AmendmentStatus.Applied);
   assert.equal(instAfter.versionIds[0], versions[0].id);
 });
 
-test('版本号：在已有 v1 基础上生效，新版本号严格递增且同事务', async () => {
+test('版本号：在 v1 基础上双方确认，新版本号严格递增为 v2', async () => {
   await resetDb();
   const db = await openFreshDb();
   const inst = signedInstance();
@@ -419,13 +483,9 @@ test('版本号：在已有 v1 基础上生效，新版本号严格递增且同�
     remark: 'v1'
   } satisfies Version);
 
-  const amd = await registerAmendmentTx(db, {
-    contractInstanceId: inst.id,
-    content: { title: '变更1', reason: '', proposedHtml: V2_HTML },
-    proposedBy: ContractParty.PartyA
-  });
-  await respondAmendmentTx(db, { amendmentId: amd.id, party: ContractParty.PartyA, action: 'confirm' });
-  const outcome = await respondAmendmentTx(db, { amendmentId: amd.id, party: ContractParty.PartyB, action: 'confirm' });
+  const { amendment, tokenA, tokenB } = await registerHelper(db, inst);
+  await confirmA(db, amendment.id, tokenA);
+  const outcome = await confirmB(db, amendment.id, tokenB);
   assert.equal(outcome.version?.versionNo, 2);
   const versions = (await db.getAllFromIndex('versions', 'byInstance', inst.id)) as Version[];
   assert.deepEqual(versions.map((v) => v.versionNo).sort(), [1, 2]);
@@ -449,19 +509,11 @@ test('串行锁：同合同动作按提交顺序执行且锁自动释放', async
   assert.deepEqual(order, [0, 1, 2, 3, 4, 5]);
 });
 
-test('迁移：v1 老库升级到 v2 后旧数据保留、索引与 amendments 可用', async () => {
-  for (const db of openDbs.splice(0)) {
-    db.close();
-  }
-  await new Promise<void>((resolve, reject) => {
-    const req = indexedDB.deleteDatabase(DB_NAME);
-    req.onsuccess = () => resolve();
-    req.onerror = () => reject(req.error);
-    req.onblocked = () => reject(new Error('deleteDatabase 被阻塞'));
-  });
+// ---------- 迁移 ----------
 
+test('迁移：v1→v3 全新升级路径，旧数据保留且可走凭据流程', async () => {
+  await resetDb();
   const { openDB } = await import('idb');
-  // 构造一个只含 v1 四个 store 的老库并写入数据
   const oldDb = await openDB(DB_NAME, 1, {
     upgrade(db) {
       db.createObjectStore('templates', { keyPath: 'id' });
@@ -482,35 +534,125 @@ test('迁移：v1 老库升级到 v2 后旧数据保留、索引与 amendments �
   } satisfies Version);
   oldDb.close();
 
-  // 走应用真实升级路径
   const migrated = await openAppDb();
   openDbs.push(migrated);
-  assert.equal(migrated.version, 2);
+  assert.equal(migrated.version, DB_VERSION);
   assert.equal(migrated.objectStoreNames.contains('amendments'), true);
-  const inspectTx = migrated.transaction('versions', 'readonly');
-  assert.equal(inspectTx.objectStore('versions').indexNames.contains('byInstance'), true);
-  await inspectTx.done;
+  const inspect = migrated.transaction('versions', 'readonly');
+  assert.equal(inspect.objectStore('versions').indexNames.contains('byInstance'), true);
+  await inspect.done;
 
-  // 旧数据保留且新索引可用
-  const legacyInst = await migrated.get('instances', 'inst_legacy');
-  assert.equal((legacyInst as ContractInstance).finalHtml, V1_HTML);
-  const legacyVersions = await migrated.getAllFromIndex('versions', 'byInstance', 'inst_legacy');
-  assert.equal(legacyVersions.length, 1);
-
-  // 升级后可以正常走完整变更流程
-  const amd = await registerAmendmentTx(migrated, {
+  const result = await registerAmendmentTx(migrated, {
     contractInstanceId: 'inst_legacy',
     content: { title: '迁移后变更', reason: '', proposedHtml: V2_HTML },
     proposedBy: ContractParty.PartyA
   });
-  await respondAmendmentTx(migrated, { amendmentId: amd.id, party: ContractParty.PartyA, action: 'confirm' });
-  const outcome = await respondAmendmentTx(migrated, { amendmentId: amd.id, party: ContractParty.PartyB, action: 'confirm' });
+  const tokenA = result.credentials.find((c) => c.party === ContractParty.PartyA)!.token;
+  const tokenB = result.credentials.find((c) => c.party === ContractParty.PartyB)!.token;
+  await respondAmendmentTx(migrated, { amendmentId: result.amendment.id, token: tokenA, action: 'confirm' });
+  const outcome = await respondAmendmentTx(migrated, { amendmentId: result.amendment.id, token: tokenB, action: 'confirm' });
   assert.equal(outcome.applied, true);
-  // 版本号在老库 v1 基础上递增为 2，而不是从 1 重新开始
-  assert.equal(outcome.version?.versionNo, 2);
+  assert.equal(outcome.version?.versionNo, 2, '版本号在老 v1 基础上续接');
 });
 
-test('getDb 单例：v2 schema 升级后可直接读到 amendments 与索引', async () => {
+test('迁移：v2 自报身份记录升级到 v3 凭据模型', async () => {
+  await resetDb();
+  const { openDB } = await import('idb');
+
+  const instApplied = signedInstance('inst_v2_applied');
+  const instPending = signedInstance('inst_v2_pending');
+  const instWithdrawn = signedInstance('inst_v2_withdrawn');
+
+  // 手工构造 v2 schema（含 byInstance 索引）
+  const v2db = await openDB(DB_NAME, 2, {
+    upgrade(db) {
+      for (const name of STORE_NAMES) {
+        if (!db.objectStoreNames.contains(name)) {
+          const store = db.createObjectStore(name, { keyPath: 'id' });
+          if (name === 'versions' || name === 'amendments') {
+            store.createIndex('byInstance', 'contractInstanceId');
+          }
+        }
+      }
+    }
+  });
+  await Promise.all([instApplied, instPending, instWithdrawn].map((i) => v2db.put('instances', i)));
+
+  const v2Amendment = (id: string, contractInstanceId: string, extra: Record<string, unknown>) => ({
+    id,
+    contractInstanceId,
+    title: '旧版变更',
+    reason: '',
+    proposedHtml: V2_HTML,
+    status: AmendmentStatus.Pending,
+    confirmedParties: [],
+    proposedBy: ContractParty.PartyA,
+    proposedAt: NOW,
+    updatedAt: NOW,
+    timeline: [{ action: 'created', party: ContractParty.PartyA, at: NOW }],
+    ...extra
+  });
+
+  await v2db.put(
+    'amendments',
+    v2Amendment('amd_applied', instApplied.id, {
+      status: AmendmentStatus.Applied,
+      confirmedParties: [ContractParty.PartyA, ContractParty.PartyB],
+      appliedAt: NOW,
+      appliedVersionId: 'ver_old',
+      baseVersionNo: 1
+    })
+  );
+  await v2db.put('amendments', v2Amendment('amd_pending', instPending.id, { confirmedParties: [ContractParty.PartyA] }));
+  await v2db.put(
+    'amendments',
+    v2Amendment('amd_withdrawn', instWithdrawn.id, {
+      status: AmendmentStatus.Withdrawn,
+      confirmedParties: [ContractParty.PartyA],
+      withdrawnBy: ContractParty.PartyB,
+      withdrawnAt: NOW
+    })
+  );
+  v2db.close();
+
+  const migrated = await openAppDb();
+  openDbs.push(migrated);
+  assert.equal(migrated.version, 3);
+
+  const applied = (await migrated.get('amendments', 'amd_applied')) as Amendment;
+  assert.equal(applied.status, AmendmentStatus.Applied);
+  assert.equal(applied.credentials[ContractParty.PartyA].usedFor, 'confirm');
+  assert.equal(applied.credentials[ContractParty.PartyB].usedFor, 'confirm');
+  assert.equal('confirmedParties' in applied, false);
+
+  const pending = (await migrated.get('amendments', 'amd_pending')) as Amendment;
+  assert.equal(pending.status, AmendmentStatus.Withdrawn, '旧在途记录无凭据可对应，必须作废');
+  assert.equal(pending.credentials[ContractParty.PartyA].used, false);
+
+  const withdrawn = (await migrated.get('amendments', 'amd_withdrawn')) as Amendment;
+  assert.equal(withdrawn.status, AmendmentStatus.Withdrawn);
+  assert.equal(withdrawn.credentials[ContractParty.PartyA].usedFor, 'confirm');
+  assert.equal(withdrawn.credentials[ContractParty.PartyB].usedFor, 'withdraw');
+
+  // 旧在途记录已作废为 withdrawn：任何票据都无法复活（终态检查先于哈希校验）
+  const token = issueCredentialPair()[0].token;
+  await assert.rejects(
+    respondAmendmentTx(migrated, { amendmentId: 'amd_pending', token, action: 'confirm' }),
+    AmendmentError
+  );
+  const pendingAfter = (await migrated.get('amendments', 'amd_pending')) as Amendment;
+  assert.equal(pendingAfter.status, AmendmentStatus.Withdrawn);
+
+  // 作废后允许重新登记
+  const re = await registerAmendmentTx(migrated, {
+    contractInstanceId: instPending.id,
+    content: { title: '重新登记', reason: '', proposedHtml: V2_HTML },
+    proposedBy: ContractParty.PartyA
+  });
+  assert.equal(re.amendment.status, AmendmentStatus.Pending);
+});
+
+test('getDb 单例：v3 打开后包含 amendments 与 byInstance 索引', async () => {
   await resetDb();
   const db = await getDb();
   assert.equal(db.version, DB_VERSION);

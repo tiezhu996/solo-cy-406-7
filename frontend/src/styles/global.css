@@ -479,3 +479,31 @@ body {
 .instance-overview-heading h5 {
   margin: 0 0 2px;
 }
+
+/* 一次性凭据 */
+.credential-row {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: center;
+}
+
+.credential-party-tag {
+  white-space: nowrap;
+}
+
+.credential-token-box textarea {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  word-break: break-all;
+}
+
+.credential-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.credential-party-hint {
+  min-height: 22px;
+}

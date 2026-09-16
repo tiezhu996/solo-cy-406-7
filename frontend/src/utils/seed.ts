@@ -81,6 +81,15 @@ const signedInstanceId = makeId('inst');
 const signedVersionId = makeId('ver');
 const pendingAmendmentId = makeId('amd');
 
+/**
+ * 演示用一次性凭据（真实环境中明文仅登记成功时展示一次）。
+ * 甲方凭据已用于确认；乙方凭据粘贴后即可完成双方确认；再次提交甲方凭据会被忽略。
+ */
+export const SEED_DEMO_TOKENS = {
+  partyA: `amd-a_${'a'.repeat(32)}`,
+  partyB: `amd-b_${'b'.repeat(32)}`
+} as const;
+
 const signedInstanceHtml =
   '<h2>劳动合同</h2><p>甲方：某某科技有限公司</p><p>乙方：张三</p><p>乙方自 2026-07-01 起入职甲方，月工资为人民币 15000 元。</p><p>双方应遵守劳动法律法规及公司制度。</p>';
 
@@ -108,31 +117,43 @@ const signedVersion: Version = {
 
 const pendingAmendmentHtml = signedInstanceHtml.replace('月工资为人民币 15000 元', '月工资为人民币 18000 元');
 
-const pendingAmendment: Amendment = {
-  id: pendingAmendmentId,
-  contractInstanceId: signedInstanceId,
-  title: '月薪调整为 18000 元',
-  reason: '年度调薪，双方口头协商一致，现走书面变更确认流程。',
-  proposedHtml: pendingAmendmentHtml,
-  status: AmendmentStatus.Pending,
-  confirmedParties: [ContractParty.PartyA],
-  proposedBy: ContractParty.PartyA,
-  proposedAt: createdAt,
-  updatedAt: createdAt,
-  timeline: [
-    { action: AmendmentAction.Created, party: ContractParty.PartyA, at: createdAt, detail: '月薪调整为 18000 元' },
-    { action: AmendmentAction.Confirmed, party: ContractParty.PartyA, at: createdAt }
-  ]
-};
+/**
+ * 种子变更需要凭据哈希，哈希是异步的，因此以工厂形式提供。
+ * 仅在本地库为空时由 store 调用一次并落库。
+ */
+export async function buildSeedAmendments(): Promise<Amendment[]> {
+  const { hashCredential } = await import('./amendmentCredential');
+  const pendingAmendment: Amendment = {
+    id: pendingAmendmentId,
+    contractInstanceId: signedInstanceId,
+    title: '月薪调整为 18000 元',
+    reason: '年度调薪，双方口头协商一致，现走书面变更确认流程。',
+    proposedHtml: pendingAmendmentHtml,
+    status: AmendmentStatus.Pending,
+    credentials: {
+      [ContractParty.PartyA]: { tokenHash: await hashCredential(SEED_DEMO_TOKENS.partyA), used: true, usedAt: createdAt, usedFor: 'confirm' },
+      [ContractParty.PartyB]: { tokenHash: await hashCredential(SEED_DEMO_TOKENS.partyB), used: false }
+    },
+    proposedBy: ContractParty.PartyA,
+    proposedAt: createdAt,
+    updatedAt: createdAt,
+    timeline: [
+      { action: AmendmentAction.Created, party: ContractParty.PartyA, at: createdAt, detail: '月薪调整为 18000 元' },
+      { action: AmendmentAction.Confirmed, party: ContractParty.PartyA, at: createdAt }
+    ]
+  };
+
+  return [pendingAmendment];
+}
+
+export { pendingAmendmentId as SEED_PENDING_AMENDMENT_ID, signedInstanceId as SEED_INSTANCE_ID };
 
 export const seedInstances: ContractInstance[] = [signedInstance];
 export const seedVersions: Version[] = [signedVersion];
-export const seedAmendments: Amendment[] = [pendingAmendment];
 
 export const seedData = {
   templates: seedTemplates,
   clauses: seedClauses,
   instances: seedInstances,
-  versions: seedVersions,
-  amendments: seedAmendments
+  versions: seedVersions
 };
