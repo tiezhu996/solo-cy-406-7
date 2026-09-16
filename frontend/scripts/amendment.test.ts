@@ -281,7 +281,19 @@ test('凭据安全：格式错误、哈希不符、跨变更复用一律拒绝�
   ];
 
   for (const bad of badInputs) {
-    await assert.rejects(confirmA(db, amendment.id, bad), CredentialVerificationError, `应收下错票: ${bad}`);
+    const expected = bad === 'not-a-token' ? 'CREDENTIAL_MALFORMED' : 'CREDENTIAL_MISMATCH';
+    await assert.rejects(
+      async () => {
+        try {
+          await confirmA(db, amendment.id, bad);
+        } catch (error) {
+          assert.equal((error as AmendmentError).code, expected, `错票应归类为 ${expected}: ${bad}`);
+          throw error;
+        }
+      },
+      CredentialVerificationError,
+      `应收下错票: ${bad}`
+    );
   }
 
   // 全部拒绝后仍停留在待确认、无确认落库
@@ -335,15 +347,24 @@ test('凭据安全：持票撤回一次性；撤回后凭据再用无效；另�
   assert.equal(w.amendment.status, AmendmentStatus.Withdrawn);
   assert.equal(w.amendment.credentials[ContractParty.PartyB].usedFor, 'withdraw');
 
-  // 撤回后同一凭据再提交：终态拒绝，状态不变
-  await assert.rejects(withdraw(db, amendment.id, tokenB), AmendmentError);
-  await assert.rejects(confirmB(db, amendment.id, tokenB), AmendmentError);
+  // 撤回后同一凭据再提交：终态拒绝（TERMINAL_STATE），状态不变
+  await assertTerminalRejection(withdraw(db, amendment.id, tokenB));
+  await assertTerminalRejection(confirmB(db, amendment.id, tokenB));
   // 甲方票也无法让已撤回的变更复活
-  await assert.rejects(confirmA(db, amendment.id, tokenA), AmendmentError);
+  await assertTerminalRejection(confirmA(db, amendment.id, tokenA));
 
   assert.equal((await db.get('instances', inst.id)).finalHtml, V1_HTML);
   assert.deepEqual(await db.getAllFromIndex('versions', 'byInstance', inst.id), []);
 });
+
+async function assertTerminalRejection(promise: Promise<unknown>) {
+  await assert.rejects(
+    promise.then(() => {
+      throw new Error('本应拒绝');
+    }),
+    (error: unknown) => error instanceof AmendmentError && error.code === 'TERMINAL_STATE'
+  );
+}
 
 test('正常流程：双方各凭合法票确认一次后，同事务生成新版本并替换正文', async () => {
   await resetDb();
@@ -445,6 +466,103 @@ test('回滚：双方确认齐备但落库失败时，正文/变更记录/版本
   assert.equal(amdAfter.credentials[ContractParty.PartyA].used, true);
   assert.equal(amdAfter.credentials[ContractParty.PartyB].used, false, '乙方确认不落库');
   assert.deepEqual(await db.getAll('versions'), []);
+
+  // 恢复实例后，乙方合法凭据仍可继续完成确认（拒绝不消耗凭据）
+  await db.put('instances', inst);
+  const retry = await confirmB(db, amendment.id, tokenB);
+  assert.equal(retry.applied, true, '失败后合法凭据仍可完成确认');
+  const amdRetry = (await db.get('amendments', amendment.id)) as Amendment;
+  assert.equal(amdRetry.status, AmendmentStatus.Applied);
+  assert.equal((await db.get('instances', inst.id) as ContractInstance).finalHtml, V2_HTML);
+});
+
+test('回滚：真正的写入失败归类为 PERSISTENCE_FAILED，回滚后凭据仍可用', async () => {
+  await resetDb();
+  const db = await openFreshDb();
+  const inst = await seedSignedContract(db);
+  const { amendment, tokenA, tokenB } = await registerHelper(db, inst);
+  await confirmA(db, amendment.id, tokenA);
+
+  // 用 Proxy 让 versions store 的下一次 put 抛错，模拟「生成新版本失败」
+  const failingDb = proxyNextPutFailure(db, 'versions', new Error('disk full'));
+  const error = await confirmB(failingDb as IDBPDatabase, amendment.id, tokenB).then(
+    () => null,
+    (reason: unknown) => reason
+  );
+  assert.ok(error instanceof AmendmentError, '应包装为 AmendmentError');
+  assert.equal((error as AmendmentError).code, 'PERSISTENCE_FAILED');
+
+  // 三者一起保持失败前状态
+  const amdAfter = (await db.get('amendments', amendment.id)) as Amendment;
+  assert.equal(amdAfter.status, AmendmentStatus.Pending);
+  assert.equal(amdAfter.credentials[ContractParty.PartyB].used, false);
+  assert.deepEqual(await db.getAllFromIndex('versions', 'byInstance', inst.id), []);
+  assert.equal((await db.get('instances', inst.id) as ContractInstance).finalHtml, V1_HTML);
+
+  // 乙方凭据未被消耗，重试可成功
+  const retry = await confirmB(db, amendment.id, tokenB);
+  assert.equal(retry.applied, true);
+  assert.equal((await db.get('instances', inst.id) as ContractInstance).finalHtml, V2_HTML);
+});
+
+/** 让指定 store 的下一次 put（且仅一次）抛错，其余操作透传 */
+function proxyNextPutFailure(db: IDBPDatabase, storeName: string, failure: Error): unknown {
+  let armed = true;
+  const wrapStore = (store: IDBPObjectStoreLike) =>
+    new Proxy(store, {
+      get(target, prop) {
+        if (prop === 'put' && armed) {
+          return (..._args: unknown[]) => {
+            armed = false;
+            throw failure;
+          };
+        }
+        const value = Reflect.get(target, prop);
+        // index/getAll 等方法必须绑定回真实对象，否则内部 this 丢失
+        return typeof value === 'function' ? value.bind(target) : value;
+      }
+    });
+
+  return new Proxy(db, {
+    get(target, prop, receiver) {
+      if (prop !== 'transaction') {
+        return Reflect.get(target, prop, receiver);
+      }
+      return (...args: unknown[]) => {
+        const tx = Reflect.apply(target.transaction, target, args);
+        if (tx.mode !== 'readwrite') {
+          return tx;
+        }
+        return new Proxy(tx, {
+          get(txTarget, txProp, txReceiver) {
+            if (txProp !== 'objectStore') {
+              const value = Reflect.get(txTarget, txProp, txReceiver);
+              return typeof value === 'function' ? value.bind(txTarget) : value;
+            }
+            return (name: string) => {
+              const store: IDBPObjectStoreLike = Reflect.apply(txTarget.objectStore, txTarget, [name]);
+              return name === storeName ? wrapStore(store) : store;
+            };
+          }
+        });
+      };
+    }
+  });
+}
+
+type IDBPObjectStoreLike = {
+  put: (...args: unknown[]) => unknown;
+  index: (name: string) => { getAll: (query?: unknown) => Promise<unknown[]> };
+  // 其余属性以宽松索引签名兼容
+  [key: string]: unknown;
+};
+
+test('反馈分类：classifyCredentialError 能区分凭据/终态/落库失败', async () => {
+  const { classifyCredentialError } = await import('../src/utils/amendmentFeedback');
+  assert.equal(classifyCredentialError(new CredentialVerificationError('x', 'CREDENTIAL_MALFORMED')).reason, 'CREDENTIAL_MALFORMED');
+  assert.equal(classifyCredentialError(new AmendmentError('已生效', 'TERMINAL_STATE')).reason, 'TERMINAL_STATE');
+  assert.equal(classifyCredentialError(new Error('boom')).reason, 'PERSISTENCE_FAILED');
+  assert.equal(classifyCredentialError('string-error').reason, 'PERSISTENCE_FAILED');
 });
 
 test('回读：生效后重开数据库，凭据状态/正文/版本一致', async () => {

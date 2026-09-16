@@ -507,3 +507,12 @@ body {
 .credential-party-hint {
   min-height: 22px;
 }
+
+.credential-feedback {
+  margin-top: 2px;
+}
+
+.credential-feedback .arco-alert-body {
+  font-size: 13px;
+  line-height: 1.6;
+}

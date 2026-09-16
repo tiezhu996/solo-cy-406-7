@@ -1,12 +1,13 @@
-import { Alert, Button, Card, Collapse, Empty, Input, Modal, Space, Tag, Timeline, Typography } from '@arco-design/web-react';
+import { Alert, Button, Card, Collapse, Empty, Input, Message, Modal, Space, Tag, Timeline, Typography } from '@arco-design/web-react';
 import { IconEdit } from '@arco-design/web-react/icon';
-import { Message } from '@arco-design/web-react';
 import { useMemo, useState } from 'react';
 import { Amendment, AmendmentAction, AmendmentStatus } from '../../types/amendment';
 import { ContractInstance } from '../../types/contract-instance';
 import { AMENDMENT_STATUS_LABELS, CONTRACT_PARTY_LABELS, ContractParty, ContractStatus } from '../../types/enums';
 import { useAmendmentStore } from '../../stores/amendment';
+import type { CredentialResponse } from '../../stores/amendment';
 import { parseCredentialParty } from '../../utils/amendmentCredential';
+import { describeRejection, FeedbackTone } from '../../utils/amendmentFeedback';
 import { SEED_DEMO_TOKENS, SEED_PENDING_AMENDMENT_ID } from '../../utils/seed';
 import { RegisterAmendmentModal } from './RegisterAmendmentModal';
 
@@ -119,30 +120,56 @@ function AmendmentHistory({ amendments }: { amendments: Amendment[] }) {
 /** 凭据输入 + 凭票确认/撤回；持票人对号到哪一侧完全由凭据前缀决定 */
 function CredentialActions({ amendment, busy }: { amendment: Amendment; busy: boolean }) {
   const [token, setToken] = useState('');
+  const [feedback, setFeedback] = useState<{ tone: FeedbackTone; text: string } | null>(null);
   const { confirm, withdraw, pendingKey } = useAmendmentStore();
 
   const trimmed = token.trim();
   const party = trimmed ? parseCredentialParty(trimmed) : null;
 
-  const handleConfirm = async () => {
-    if (!trimmed) {
-      Message.warning('请粘贴本方持有的一次性凭据');
+  // 统一消费判别结果：成功 / 幂等忽略 / 拒绝（含原因码）都在这里给出操作处反馈
+  const handleResponse = (response: CredentialResponse, action: 'confirm' | 'withdraw') => {
+    if (response.kind === 'ok') {
+      if (action === 'withdraw') {
+        // 撤回成功后本卡片立即移入历史区，内联提示会随卡片卸载，改用全局提示
+        Message.success('凭据有效，变更已撤回并失效；合同正文与版本未受影响。');
+      } else if (response.applied) {
+        Message.success('双方确认完成，新版本已生成并替换当前正文；变更记录与版本号已同步。');
+      } else {
+        setFeedback({
+          tone: 'success',
+          text: `${CONTRACT_PARTY_LABELS[response.party]}凭据有效，已确认；等待另一方凭据确认。`
+        });
+      }
+      // 成功后清空凭据输入；切到下一条待确认时组件随卡片重挂载
+      setToken('');
       return;
     }
-    const result = await confirm(amendment.id, trimmed);
-    if (result.ignored) {
-      Message.info('该凭据已使用过，重复提交不产生第二次效果');
-    } else if (result.applied) {
-      Message.success('双方确认完成，新版本已生成并替换当前正文');
-    } else {
-      Message.success(`${result.party ? CONTRACT_PARTY_LABELS[result.party] : ''}凭据有效，已确认；等待另一方凭据确认`);
+
+    if (response.kind === 'ignored') {
+      setFeedback({
+        tone: 'warning',
+        text: `${CONTRACT_PARTY_LABELS[response.party]}凭据此前已使用过，本次为幂等忽略，未产生第二次效果；状态、正文、版本均不变。`
+      });
+      return;
     }
-    setToken('');
+
+    const described = describeRejection(response.reason, response.message, action);
+    setFeedback({ tone: described.tone, text: described.inline });
+  };
+
+  const handleConfirm = async () => {
+    if (!trimmed) {
+      setFeedback({ tone: 'warning', text: '请粘贴本方持有的一次性凭据后再确认。' });
+      return;
+    }
+    setFeedback(null);
+    const response = await confirm(amendment.id, trimmed);
+    handleResponse(response, 'confirm');
   };
 
   const handleWithdraw = () => {
     if (!trimmed) {
-      Message.warning('请粘贴本方持有的一次性凭据');
+      setFeedback({ tone: 'warning', text: '请粘贴本方持有的一次性凭据后再撤回。' });
       return;
     }
     Modal.confirm({
@@ -152,13 +179,8 @@ function CredentialActions({ amendment, busy }: { amendment: Amendment; busy: bo
       cancelText: '取消',
       okButtonProps: { status: 'danger' },
       onOk: async () => {
-        const result = await withdraw(amendment.id, trimmed);
-        if (result.ignored) {
-          Message.info('该凭据已使用过，重复提交不产生第二次效果');
-        } else {
-          Message.success('凭据有效，变更已撤回并失效');
-        }
-        setToken('');
+        const response = await withdraw(amendment.id, trimmed);
+        handleResponse(response, 'withdraw');
       }
     });
   };
@@ -167,10 +189,16 @@ function CredentialActions({ amendment, busy }: { amendment: Amendment; busy: bo
     <div className="credential-actions">
       <Input.Password
         value={token}
-        onChange={setToken}
+        onChange={(value) => {
+          setToken(value);
+          if (feedback) {
+            setFeedback(null);
+          }
+        }}
         placeholder="粘贴一次性确认凭据（amd-a_… 或 amd-b_…）"
         visibilityToggle
         disabled={busy}
+        status={feedback?.tone === 'error' ? 'error' : undefined}
       />
       <Space size={4} className="credential-party-hint">
         {party ? (
@@ -193,6 +221,15 @@ function CredentialActions({ amendment, busy }: { amendment: Amendment; busy: bo
           凭票撤回（整条失效）
         </Button>
       </Space>
+
+      {feedback && (
+        <Alert
+          className="credential-feedback"
+          type={feedback.tone === 'info' ? 'info' : feedback.tone}
+          showIcon
+          content={feedback.text}
+        />
+      )}
     </div>
   );
 }

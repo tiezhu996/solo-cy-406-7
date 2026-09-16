@@ -2,10 +2,12 @@ import { create } from 'zustand';
 import { amendmentDb } from '../api/db';
 import { Amendment, AmendmentContent, CredentialAction, IssuedCredential } from '../types/amendment';
 import { ContractParty } from '../types/enums';
+import { AmendmentErrorCode } from '../utils/amendmentMachine';
 import { Version } from '../types/version';
 import { getDb, putRecord } from '../utils/db';
 import { buildSeedAmendments } from '../utils/seed';
 import { registerAmendmentTx, respondAmendmentTx } from '../utils/amendmentTx';
+import { classifyCredentialError } from '../utils/amendmentFeedback';
 import { useInstanceStore } from './instance';
 import { useVersionStore } from './version';
 
@@ -14,6 +16,18 @@ interface RegisterOutcome {
   /** 甲、乙各自的一次性凭据，明文只在此出现一次 */
   credentials: IssuedCredential[];
 }
+
+/**
+ * 凭据操作的判别结果。UI 必须能区分三种情况：
+ * - ok：确认 / 撤回已落库（applied 表示本次恰好促成双方确认、新版本已生成）；
+ * - ignored：凭据真实有效但已使用，幂等忽略，状态没有任何变化；
+ * - rejected：凭据或状态不被接受（reason 给出原因码），或落库失败（事务已回滚）。
+ * 任何 rejected 都不改变持久化状态，合法凭据仍可继续完成确认或撤回。
+ */
+export type CredentialResponse =
+  | { kind: 'ok'; amendment: Amendment; applied: boolean; party: ContractParty; version?: Version; instanceId?: string }
+  | { kind: 'ignored'; amendment: Amendment; party: ContractParty }
+  | { kind: 'rejected'; reason: AmendmentErrorCode; message: string; amendment: Amendment | null };
 
 interface AmendmentState {
   amendments: Amendment[];
@@ -26,10 +40,10 @@ interface AmendmentState {
     content: AmendmentContent;
     proposedBy: ContractParty;
   }) => Promise<RegisterOutcome>;
-  /** 凭一次性凭据确认；同一凭据第二次提交不会产生效果 */
-  confirm: (amendmentId: string, token: string) => Promise<{ applied: boolean; ignored: boolean; party?: ContractParty }>;
-  /** 凭一次性凭据撤回；撤回后整条变更失效 */
-  withdraw: (amendmentId: string, token: string) => Promise<{ ignored: boolean; party?: ContractParty }>;
+  /** 凭一次性凭据确认；永不向调用方抛异常，结果以判别联合返回 */
+  confirm: (amendmentId: string, token: string) => Promise<CredentialResponse>;
+  /** 凭一次性凭据撤回；永不向调用方抛异常，结果以判别联合返回 */
+  withdraw: (amendmentId: string, token: string) => Promise<CredentialResponse>;
 }
 
 function sortAmendments(amendments: Amendment[]) {
@@ -45,7 +59,7 @@ function sortVersions(versions: Version[], version: Version) {
   return [...versions.filter((item) => item.id !== version.id), version].sort((a, b) => b.createdAt.localeCompare(a.createdAt));
 }
 
-export const useAmendmentStore = create<AmendmentState>((set) => ({
+export const useAmendmentStore = create<AmendmentState>((set, get) => ({
   amendments: [],
   loading: false,
   pendingKey: null,
@@ -78,41 +92,69 @@ export const useAmendmentStore = create<AmendmentState>((set) => ({
   },
 
   async confirm(amendmentId, token) {
-    set({ pendingKey: `confirm:${amendmentId}` });
-    try {
-      const db = await getDb();
-      const outcome = await respondAmendmentTx(db, { amendmentId, token: token.trim(), action: 'confirm' satisfies CredentialAction });
-      if (!outcome.ignored) {
-        set((state) => ({ amendments: upsert(state.amendments, outcome.amendment) }));
-      }
-
-      // 仅在事务提交成功后同步实例 / 版本内存缓存，刷新后由 IndexedDB 回读一致结果
-      if (outcome.applied && outcome.instance && outcome.version) {
-        useInstanceStore.setState((state) => ({
-          instances: state.instances.map((item) => (item.id === outcome.instance!.id ? outcome.instance! : item))
-        }));
-        useVersionStore.setState((state) => ({
-          versions: sortVersions(state.versions, outcome.version!)
-        }));
-      }
-
-      return { applied: outcome.applied, ignored: Boolean(outcome.ignored), party: outcome.party };
-    } finally {
-      set({ pendingKey: null });
-    }
+    return runCredentialAction(set, get, amendmentId, token, 'confirm');
   },
 
   async withdraw(amendmentId, token) {
-    set({ pendingKey: `withdraw:${amendmentId}` });
-    try {
-      const db = await getDb();
-      const outcome = await respondAmendmentTx(db, { amendmentId, token: token.trim(), action: 'withdraw' satisfies CredentialAction });
-      if (!outcome.ignored) {
-        set((state) => ({ amendments: upsert(state.amendments, outcome.amendment) }));
-      }
-      return { ignored: Boolean(outcome.ignored), party: outcome.party };
-    } finally {
-      set({ pendingKey: null });
-    }
+    return runCredentialAction(set, get, amendmentId, token, 'withdraw');
   }
 }));
+
+async function runCredentialAction(
+  set: (partial: Partial<AmendmentState> | ((state: AmendmentState) => Partial<AmendmentState>)) => void,
+  get: () => AmendmentState,
+  amendmentId: string,
+  token: string,
+  action: CredentialAction
+): Promise<CredentialResponse> {
+  set({ pendingKey: `${action}:${amendmentId}` });
+  try {
+    const db = await getDb();
+    const outcome = await respondAmendmentTx(db, { amendmentId, token: token.trim(), action });
+
+    if (outcome.ignored) {
+      // 幂等忽略：不写库、不改缓存，仅回传当前状态
+      return { kind: 'ignored', amendment: outcome.amendment, party: outcome.party! };
+    }
+
+    set((state) => ({ amendments: upsert(state.amendments, outcome.amendment) }));
+
+    // 仅在事务提交成功后同步实例 / 版本内存缓存，刷新后由 IndexedDB 回读一致结果
+    if (outcome.applied && outcome.instance && outcome.version) {
+      useInstanceStore.setState((state) => ({
+        instances: state.instances.map((item) => (item.id === outcome.instance!.id ? outcome.instance! : item))
+      }));
+      useVersionStore.setState((state) => ({
+        versions: sortVersions(state.versions, outcome.version!)
+      }));
+    }
+
+    return {
+      kind: 'ok',
+      amendment: outcome.amendment,
+      applied: outcome.applied,
+      party: outcome.party!,
+      version: outcome.version,
+      instanceId: outcome.instance?.id
+    };
+  } catch (error) {
+    // 任何拒绝（凭据问题 / 终态 / 落库失败）都不向 UI 抛出；
+    // 从库内回读该变更，确保内存缓存与磁盘一致，再把原因码交给 UI 内联展示。
+    let persisted: Amendment | undefined;
+    try {
+      const db = await getDb();
+      persisted = (await db.get('amendments', amendmentId)) as Amendment | undefined;
+    } catch {
+      // 回读本身失败时退回内存中的最近状态，反馈链路仍然可用
+      persisted = get().amendments.find((a) => a.id === amendmentId);
+    }
+    if (persisted) {
+      set((state) => ({ amendments: upsert(state.amendments, persisted!) }));
+    }
+
+    const { reason, message } = classifyCredentialError(error);
+    return { kind: 'rejected', reason, message, amendment: persisted ?? null };
+  } finally {
+    set({ pendingKey: null });
+  }
+}

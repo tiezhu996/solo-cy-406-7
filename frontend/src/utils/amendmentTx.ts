@@ -4,7 +4,7 @@ import { ContractInstance } from '../types/contract-instance';
 import { ContractParty, ContractStatus } from '../types/enums';
 import { Version } from '../types/version';
 import { makeId, nowIso } from './db';
-import { AmendmentError, applyCredentialAction, buildCredentialHashes, createAmendment, isTerminal, markApplied } from './amendmentMachine';
+import { AmendmentError, AmendmentErrorCode, applyCredentialAction, buildCredentialHashes, createAmendment, isTerminal, markApplied } from './amendmentMachine';
 import { hashCredential, issueCredentialPair, parseCredentialParty, timingSafeEqual } from './amendmentCredential';
 
 /**
@@ -30,12 +30,32 @@ export function serializeForInstance<T>(contractInstanceId: string, task: () => 
   return current;
 }
 
-/** 凭据问题（格式错误 / 跨变更复用 / 哈希不符）；已使用凭据不走异常而走 ignored */
+/** 凭据不被承认：格式错误（CREDENTIAL_MALFORMED）或哈希不符（CREDENTIAL_MISMATCH） */
 export class CredentialVerificationError extends AmendmentError {
-  constructor(message: string) {
-    super(message);
+  constructor(message: string, code: 'CREDENTIAL_MALFORMED' | 'CREDENTIAL_MISMATCH') {
+    super(message, code);
     this.name = 'CredentialVerificationError';
   }
+}
+
+/** 提交阶段写入失败：事务已 abort，正文/变更记录/版本号三者保持不变 */
+export class PersistenceFailureError extends AmendmentError {
+  readonly cause: unknown;
+
+  constructor(message: string, cause: unknown) {
+    super(message, 'PERSISTENCE_FAILED');
+    this.name = 'PersistenceFailureError';
+    this.cause = cause;
+  }
+}
+
+/** 把「凭据校验通过之后」出现的提交/生成失败统一包装为 PERSISTENCE_FAILED */
+function asPersistenceFailure(error: unknown): AmendmentError {
+  if (error instanceof AmendmentError) {
+    // 终态、已用票等业务拒绝保持原原因码
+    return error;
+  }
+  return new PersistenceFailureError('变更落库失败，事务已回滚：合同正文、变更记录和版本号均未改变', error);
 }
 
 export interface RegisterResult {
@@ -61,10 +81,10 @@ export interface RespondOutcome {
 
 function assertSigned(instance: ContractInstance | undefined, contractInstanceId: string): asserts instance is ContractInstance {
   if (!instance) {
-    throw new AmendmentError('合同实例不存在，无法登记变更');
+    throw new AmendmentError('合同实例不存在，无法登记变更', 'NOT_FOUND');
   }
   if (instance.status !== ContractStatus.Signed) {
-    throw new AmendmentError('仅已签署合同可以提出变更');
+    throw new AmendmentError('仅已签署合同可以提出变更', 'NOT_SIGNED');
   }
 }
 
@@ -77,10 +97,10 @@ export async function registerAmendmentTx(
   params: { contractInstanceId: string; content: AmendmentContent; proposedBy: ContractParty }
 ): Promise<RegisterResult> {
   if (!params.content.proposedHtml.replace(/<[^>]*>/g, '').trim()) {
-    throw new AmendmentError('变更后正文不能为空');
+    throw new AmendmentError('变更后正文不能为空', 'INVALID_CONTENT');
   }
   if (!params.content.title.trim()) {
-    throw new AmendmentError('变更标题不能为空');
+    throw new AmendmentError('变更标题不能为空', 'INVALID_CONTENT');
   }
 
   // 明文凭据在事务外生成、哈希在事务外算好（异步 digest 不能放在事务内 await）
@@ -100,7 +120,7 @@ export async function registerAmendmentTx(
 
       const existing = (await amendmentStore.index('byInstance').getAll(params.contractInstanceId)) as Amendment[];
       if (existing.some((item) => item.status === 'pending')) {
-        throw new AmendmentError('该合同已有待双方确认的变更，请先完成确认或撤回');
+        throw new AmendmentError('该合同已有待双方确认的变更，请先完成确认或撤回', 'PENDING_EXISTS');
       }
 
       const created = createAmendment({
@@ -120,7 +140,7 @@ export async function registerAmendmentTx(
       return created;
     } catch (error) {
       tx.abort();
-      throw error;
+      throw asPersistenceFailure(error);
     }
   });
 
@@ -145,14 +165,17 @@ export async function respondAmendmentTx(
   const preamble = db.transaction('amendments', 'readonly');
   const amendmentRef = (await preamble.objectStore('amendments').get(params.amendmentId)) as Amendment | undefined;
   if (!amendmentRef) {
-    throw new AmendmentError('变更记录不存在');
+    throw new AmendmentError('变更记录不存在', 'NOT_FOUND');
   }
   const contractInstanceId = amendmentRef.contractInstanceId;
 
   // 格式预检在锁外即可失败（不依赖库内状态）
   const partyFromToken = parseCredentialParty(params.token);
   if (!partyFromToken) {
-    throw new CredentialVerificationError('凭据格式不正确：应为登记时分发的一次性确认凭据');
+    throw new CredentialVerificationError(
+      '凭据格式错误：应为登记时分发的一次性凭据（amd-a_… 或 amd-b_…），请核对后重试',
+      'CREDENTIAL_MALFORMED'
+    );
   }
 
   return serializeForInstance(contractInstanceId, async () => {
@@ -168,21 +191,27 @@ export async function respondAmendmentTx(
 
       const amendment = (await amendmentStore.get(params.amendmentId)) as Amendment | undefined;
       if (!amendment) {
-        throw new AmendmentError('变更记录不存在');
+        throw new AmendmentError('变更记录不存在', 'NOT_FOUND');
       }
       if (isTerminal(amendment.status)) {
-        throw new AmendmentError(`变更已${amendment.status === 'applied' ? '生效' : '撤回'}，操作无效`);
+        throw new AmendmentError(
+          `变更已${amendment.status === 'applied' ? '生效' : '撤回'}，凭据操作不再有效`,
+          'TERMINAL_STATE'
+        );
       }
 
       // —— 验票：当事方由票据前缀决定（锁外已解析），哈希必须与库内槽位一致 ——
       const party = partyFromToken;
       const slot = amendment.credentials[party];
       if (!slot) {
-        throw new CredentialVerificationError('该凭据不属于本变更的任何一方');
+        throw new CredentialVerificationError('凭据校验失败：该凭据不属于本变更的任何一方', 'CREDENTIAL_MISMATCH');
       }
       if (!timingSafeEqual(tokenHash, slot.tokenHash)) {
-        // 跨变更复用、他方票据、伪造票据都落在这里
-        throw new CredentialVerificationError('凭据校验失败：与本变更登记时分发的凭据不匹配');
+        // 跨变更复用、他方票据、伪造或篡改都落在这里
+        throw new CredentialVerificationError(
+          '凭据校验失败：与本变更登记时分发的凭据不匹配（可能是跨变更复用、他方凭据或输入有误），本次操作未生效',
+          'CREDENTIAL_MISMATCH'
+        );
       }
 
       const now = nowIso();
@@ -240,9 +269,10 @@ export async function respondAmendmentTx(
       await tx.done;
       return { amendment: applied, applied: true, party, version, instance: nextInstance };
     } catch (error) {
-      // 任何失败（含生成新版本失败、落库异常）：整体回滚，正文/变更记录/版本号均不变
+      // 任何提交阶段失败（含生成新版本失败、落库异常）：整体回滚，
+      // 合同正文、变更记录、版本号均不变；凭据尚未标记为已使用，仍可重试。
       tx.abort();
-      throw error;
+      throw asPersistenceFailure(error);
     }
   });
 }

@@ -5,7 +5,31 @@ import { hashCredential } from './amendmentCredential';
 /** 合同当事方全集：双方都确认后变更才可生效 */
 export const ALL_PARTIES: readonly ContractParty[] = [ContractParty.PartyA, ContractParty.PartyB];
 
-export class AmendmentError extends Error {}
+/**
+ * 失败原因码。UI 据此给出「格式错误 / 跨变更复用 / 已使用 / 终态 / 落库失败」
+ * 的针对性提示；除 ignored 外任何拒绝都不改变持久化状态。
+ */
+export type AmendmentErrorCode =
+  | 'INVALID_CONTENT' // 登记内容校验失败（标题/正文为空）
+  | 'NOT_FOUND' // 变更或合同实例不存在
+  | 'NOT_SIGNED' // 合同未签署
+  | 'PENDING_EXISTS' // 同一合同已有在途变更
+  | 'TERMINAL_STATE' // 变更已生效/已撤回，操作不再有效
+  | 'CREDENTIAL_MALFORMED' // 凭据格式错误
+  | 'CREDENTIAL_MISMATCH' // 凭据哈希不符：跨变更复用、他方票据、伪造或篡改
+  | 'CREDENTIAL_USED' // 凭据已使用（正常路径走 ignored，此码为状态机防线）
+  | 'PERSISTENCE_FAILED' // 落库/事务提交失败，已整体回滚
+  | 'ILLEGAL_STATE'; // 不应出现的内部前置条件违反
+
+export class AmendmentError extends Error {
+  readonly code: AmendmentErrorCode;
+
+  constructor(message: string, code: AmendmentErrorCode = 'ILLEGAL_STATE') {
+    super(message);
+    this.name = 'AmendmentError';
+    this.code = code;
+  }
+}
 
 export function isTerminal(status: AmendmentStatus) {
   return status === AmendmentStatus.Applied || status === AmendmentStatus.Withdrawn;
@@ -42,7 +66,7 @@ export function createAmendment(input: {
   for (const party of ALL_PARTIES) {
     // 两侧槽位必须齐全，缺一不可
     if (!input.credentialHashes[party]) {
-      throw new AmendmentError('甲、乙双方凭据必须同时签发');
+      throw new AmendmentError('甲、乙双方凭据必须同时签发', 'ILLEGAL_STATE');
     }
     credentials[party] = { tokenHash: input.credentialHashes[party], used: false };
   }
@@ -91,17 +115,17 @@ export function applyCredentialAction(
   now: string
 ): { amendment: Amendment; ready: boolean } {
   if (isTerminal(amendment.status)) {
-    throw new AmendmentError(`变更已处于「${amendment.status}」状态，操作无效`);
+    throw new AmendmentError(`变更已${amendment.status === 'applied' ? '生效' : '撤回'}，操作不再有效`, 'TERMINAL_STATE');
   }
 
   const slot = amendment.credentials[party];
   if (!slot) {
-    throw new AmendmentError('该方不存在凭据槽');
+    throw new AmendmentError('该方不存在凭据槽', 'ILLEGAL_STATE');
   }
   // 防线：事务层已对「已用凭据」做幂等忽略；落到这里仍为已用时必须拒绝，
   // 保证同一枚凭据在状态机层面也不可能产生第二次效果。
   if (slot.used) {
-    throw new AmendmentError('该凭据已使用过，不能再次生效');
+    throw new AmendmentError('该凭据已使用过，不能再次生效', 'CREDENTIAL_USED');
   }
 
   if (action === 'withdraw') {
@@ -151,7 +175,7 @@ function consumeCredential(
  */
 export function markApplied(amendment: Amendment, versionId: string, baseVersionNo: number, now: string): Amendment {
   if (amendment.status !== AmendmentStatus.Pending || !bothConfirmed(amendment)) {
-    throw new AmendmentError('只有双方均已凭合法凭据确认的待确认变更才能标记生效');
+    throw new AmendmentError('只有双方均已凭合法凭据确认的待确认变更才能标记生效', 'ILLEGAL_STATE');
   }
 
   return {

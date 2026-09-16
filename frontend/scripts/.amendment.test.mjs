@@ -86,7 +86,7 @@ function createAmendment(input) {
   const credentials = {};
   for (const party of ALL_PARTIES) {
     if (!input.credentialHashes[party]) {
-      throw new AmendmentError("\u7532\u3001\u4E59\u53CC\u65B9\u51ED\u636E\u5FC5\u987B\u540C\u65F6\u7B7E\u53D1");
+      throw new AmendmentError("\u7532\u3001\u4E59\u53CC\u65B9\u51ED\u636E\u5FC5\u987B\u540C\u65F6\u7B7E\u53D1", "ILLEGAL_STATE");
     }
     credentials[party] = { tokenHash: input.credentialHashes[party], used: false };
   }
@@ -118,14 +118,14 @@ async function buildCredentialHashes(issued) {
 }
 function applyCredentialAction(amendment, party, action, now) {
   if (isTerminal(amendment.status)) {
-    throw new AmendmentError(`\u53D8\u66F4\u5DF2\u5904\u4E8E\u300C${amendment.status}\u300D\u72B6\u6001\uFF0C\u64CD\u4F5C\u65E0\u6548`);
+    throw new AmendmentError(`\u53D8\u66F4\u5DF2${amendment.status === "applied" ? "\u751F\u6548" : "\u64A4\u56DE"}\uFF0C\u64CD\u4F5C\u4E0D\u518D\u6709\u6548`, "TERMINAL_STATE");
   }
   const slot = amendment.credentials[party];
   if (!slot) {
-    throw new AmendmentError("\u8BE5\u65B9\u4E0D\u5B58\u5728\u51ED\u636E\u69FD");
+    throw new AmendmentError("\u8BE5\u65B9\u4E0D\u5B58\u5728\u51ED\u636E\u69FD", "ILLEGAL_STATE");
   }
   if (slot.used) {
-    throw new AmendmentError("\u8BE5\u51ED\u636E\u5DF2\u4F7F\u7528\u8FC7\uFF0C\u4E0D\u80FD\u518D\u6B21\u751F\u6548");
+    throw new AmendmentError("\u8BE5\u51ED\u636E\u5DF2\u4F7F\u7528\u8FC7\uFF0C\u4E0D\u80FD\u518D\u6B21\u751F\u6548", "CREDENTIAL_USED");
   }
   if (action === "withdraw") {
     const withdrawn = {
@@ -160,7 +160,7 @@ function consumeCredential(credentials, party, action, now) {
 }
 function markApplied(amendment, versionId, baseVersionNo, now) {
   if (amendment.status !== "pending" /* Pending */ || !bothConfirmed(amendment)) {
-    throw new AmendmentError("\u53EA\u6709\u53CC\u65B9\u5747\u5DF2\u51ED\u5408\u6CD5\u51ED\u636E\u786E\u8BA4\u7684\u5F85\u786E\u8BA4\u53D8\u66F4\u624D\u80FD\u6807\u8BB0\u751F\u6548");
+    throw new AmendmentError("\u53EA\u6709\u53CC\u65B9\u5747\u5DF2\u51ED\u5408\u6CD5\u51ED\u636E\u786E\u8BA4\u7684\u5F85\u786E\u8BA4\u53D8\u66F4\u624D\u80FD\u6807\u8BB0\u751F\u6548", "ILLEGAL_STATE");
   }
   return {
     ...amendment,
@@ -185,6 +185,12 @@ var init_amendmentMachine = __esm({
     init_amendmentCredential();
     ALL_PARTIES = ["partyA" /* PartyA */, "partyB" /* PartyB */];
     AmendmentError = class extends Error {
+      code;
+      constructor(message, code = "ILLEGAL_STATE") {
+        super(message);
+        this.name = "AmendmentError";
+        this.code = code;
+      }
     };
   }
 });
@@ -247,6 +253,55 @@ var init_amendmentMigrate = __esm({
     init_amendment();
     init_amendmentMachine();
     PLACEHOLDER_HASH = "migration-placeholder";
+  }
+});
+
+// src/utils/amendmentFeedback.ts
+var amendmentFeedback_exports = {};
+__export(amendmentFeedback_exports, {
+  classifyCredentialError: () => classifyCredentialError,
+  describeRejection: () => describeRejection
+});
+function classifyCredentialError(error) {
+  if (error && typeof error === "object" && "code" in error) {
+    const reason = error.code;
+    if (reason) {
+      return { reason, message: error instanceof Error ? error.message : "\u64CD\u4F5C\u88AB\u62D2\u7EDD" };
+    }
+  }
+  return {
+    reason: "PERSISTENCE_FAILED",
+    message: error instanceof Error ? error.message : "\u64CD\u4F5C\u5931\u8D25\uFF0C\u8BF7\u91CD\u8BD5"
+  };
+}
+function describeRejection(reason, message, action) {
+  const verb = action === "confirm" ? "\u786E\u8BA4" : "\u64A4\u56DE";
+  switch (reason) {
+    case "CREDENTIAL_MALFORMED":
+      return { tone: "error", inline: `\u51ED\u636E\u683C\u5F0F\u9519\u8BEF\uFF1A${message}\u3002\u53D8\u66F4\u4ECD\u4E3A\u5F85\u786E\u8BA4\uFF0C\u5408\u540C\u6B63\u6587\u548C\u7248\u672C\u672A\u6539\u53D8\u3002` };
+    case "CREDENTIAL_MISMATCH":
+      return {
+        tone: "error",
+        inline: `\u51ED\u636E\u4E0D\u88AB\u63A5\u53D7\uFF08\u8DE8\u53D8\u66F4\u590D\u7528\u3001\u4ED6\u65B9\u51ED\u636E\u6216\u5185\u5BB9\u6709\u8BEF\uFF09\uFF0C${verb}\u672A\u6267\u884C\u3002\u53D8\u66F4\u8BB0\u5F55\u3001\u6B63\u6587\u548C\u7248\u672C\u5747\u672A\u6539\u53D8\uFF0C\u8BF7\u4F7F\u7528\u672C\u53D8\u66F4\u767B\u8BB0\u65F6\u5206\u53D1\u7ED9\u672C\u65B9\u7684\u51ED\u636E\u91CD\u8BD5\u3002`
+      };
+    case "CREDENTIAL_USED":
+      return { tone: "info", inline: "\u8BE5\u51ED\u636E\u5DF2\u4F7F\u7528\u8FC7\uFF0C\u4E0D\u80FD\u518D\u6B21\u751F\u6548\uFF1B\u72B6\u6001\u4FDD\u6301\u4E0D\u53D8\u3002" };
+    case "TERMINAL_STATE":
+      return { tone: "warning", inline: `${message}\u3002\u8BF7\u5728\u53D8\u66F4\u5217\u8868\u4E2D\u67E5\u770B\u5F53\u524D\u72B6\u6001\u3002` };
+    case "NOT_FOUND":
+      return { tone: "error", inline: "\u672A\u627E\u5230\u5BF9\u5E94\u53D8\u66F4\u8BB0\u5F55\uFF0C\u5237\u65B0\u9875\u9762\u540E\u82E5\u4ECD\u5F02\u5E38\u8BF7\u91CD\u65B0\u6253\u5F00\u5408\u540C\u3002" };
+    case "PERSISTENCE_FAILED":
+      return {
+        tone: "error",
+        inline: `\u843D\u5E93\u5931\u8D25\uFF0C\u672C\u6B21${verb}\u5DF2\u6574\u4F53\u56DE\u6EDA\u2014\u2014\u5408\u540C\u6B63\u6587\u3001\u53D8\u66F4\u8BB0\u5F55\u548C\u7248\u672C\u53F7\u4FDD\u6301\u5931\u8D25\u524D\u4E00\u81F4\u3002\u8BF7\u4F7F\u7528\u5408\u6CD5\u51ED\u636E\u91CD\u8BD5\u3002`
+      };
+    default:
+      return { tone: "error", inline: message || `${verb}\u5931\u8D25\uFF0C\u8BF7\u91CD\u8BD5\u3002` };
+  }
+}
+var init_amendmentFeedback = __esm({
+  "src/utils/amendmentFeedback.ts"() {
+    "use strict";
   }
 });
 
@@ -327,25 +382,39 @@ function serializeForInstance(contractInstanceId, task) {
   return current;
 }
 var CredentialVerificationError = class extends AmendmentError {
-  constructor(message) {
-    super(message);
+  constructor(message, code) {
+    super(message, code);
     this.name = "CredentialVerificationError";
   }
 };
+var PersistenceFailureError = class extends AmendmentError {
+  cause;
+  constructor(message, cause) {
+    super(message, "PERSISTENCE_FAILED");
+    this.name = "PersistenceFailureError";
+    this.cause = cause;
+  }
+};
+function asPersistenceFailure(error) {
+  if (error instanceof AmendmentError) {
+    return error;
+  }
+  return new PersistenceFailureError("\u53D8\u66F4\u843D\u5E93\u5931\u8D25\uFF0C\u4E8B\u52A1\u5DF2\u56DE\u6EDA\uFF1A\u5408\u540C\u6B63\u6587\u3001\u53D8\u66F4\u8BB0\u5F55\u548C\u7248\u672C\u53F7\u5747\u672A\u6539\u53D8", error);
+}
 function assertSigned(instance, contractInstanceId) {
   if (!instance) {
-    throw new AmendmentError("\u5408\u540C\u5B9E\u4F8B\u4E0D\u5B58\u5728\uFF0C\u65E0\u6CD5\u767B\u8BB0\u53D8\u66F4");
+    throw new AmendmentError("\u5408\u540C\u5B9E\u4F8B\u4E0D\u5B58\u5728\uFF0C\u65E0\u6CD5\u767B\u8BB0\u53D8\u66F4", "NOT_FOUND");
   }
   if (instance.status !== "signed" /* Signed */) {
-    throw new AmendmentError("\u4EC5\u5DF2\u7B7E\u7F72\u5408\u540C\u53EF\u4EE5\u63D0\u51FA\u53D8\u66F4");
+    throw new AmendmentError("\u4EC5\u5DF2\u7B7E\u7F72\u5408\u540C\u53EF\u4EE5\u63D0\u51FA\u53D8\u66F4", "NOT_SIGNED");
   }
 }
 async function registerAmendmentTx(db, params) {
   if (!params.content.proposedHtml.replace(/<[^>]*>/g, "").trim()) {
-    throw new AmendmentError("\u53D8\u66F4\u540E\u6B63\u6587\u4E0D\u80FD\u4E3A\u7A7A");
+    throw new AmendmentError("\u53D8\u66F4\u540E\u6B63\u6587\u4E0D\u80FD\u4E3A\u7A7A", "INVALID_CONTENT");
   }
   if (!params.content.title.trim()) {
-    throw new AmendmentError("\u53D8\u66F4\u6807\u9898\u4E0D\u80FD\u4E3A\u7A7A");
+    throw new AmendmentError("\u53D8\u66F4\u6807\u9898\u4E0D\u80FD\u4E3A\u7A7A", "INVALID_CONTENT");
   }
   const credentials = issueCredentialPair();
   const credentialHashes = await buildCredentialHashes(credentials);
@@ -359,7 +428,7 @@ async function registerAmendmentTx(db, params) {
       assertSigned(instance, params.contractInstanceId);
       const existing = await amendmentStore.index("byInstance").getAll(params.contractInstanceId);
       if (existing.some((item) => item.status === "pending")) {
-        throw new AmendmentError("\u8BE5\u5408\u540C\u5DF2\u6709\u5F85\u53CC\u65B9\u786E\u8BA4\u7684\u53D8\u66F4\uFF0C\u8BF7\u5148\u5B8C\u6210\u786E\u8BA4\u6216\u64A4\u56DE");
+        throw new AmendmentError("\u8BE5\u5408\u540C\u5DF2\u6709\u5F85\u53CC\u65B9\u786E\u8BA4\u7684\u53D8\u66F4\uFF0C\u8BF7\u5148\u5B8C\u6210\u786E\u8BA4\u6216\u64A4\u56DE", "PENDING_EXISTS");
       }
       const created = createAmendment({
         id: makeId("amd"),
@@ -378,7 +447,7 @@ async function registerAmendmentTx(db, params) {
       return created;
     } catch (error) {
       tx.abort();
-      throw error;
+      throw asPersistenceFailure(error);
     }
   });
   return { amendment, credentials };
@@ -387,12 +456,15 @@ async function respondAmendmentTx(db, params) {
   const preamble = db.transaction("amendments", "readonly");
   const amendmentRef = await preamble.objectStore("amendments").get(params.amendmentId);
   if (!amendmentRef) {
-    throw new AmendmentError("\u53D8\u66F4\u8BB0\u5F55\u4E0D\u5B58\u5728");
+    throw new AmendmentError("\u53D8\u66F4\u8BB0\u5F55\u4E0D\u5B58\u5728", "NOT_FOUND");
   }
   const contractInstanceId = amendmentRef.contractInstanceId;
   const partyFromToken = parseCredentialParty(params.token);
   if (!partyFromToken) {
-    throw new CredentialVerificationError("\u51ED\u636E\u683C\u5F0F\u4E0D\u6B63\u786E\uFF1A\u5E94\u4E3A\u767B\u8BB0\u65F6\u5206\u53D1\u7684\u4E00\u6B21\u6027\u786E\u8BA4\u51ED\u636E");
+    throw new CredentialVerificationError(
+      "\u51ED\u636E\u683C\u5F0F\u9519\u8BEF\uFF1A\u5E94\u4E3A\u767B\u8BB0\u65F6\u5206\u53D1\u7684\u4E00\u6B21\u6027\u51ED\u636E\uFF08amd-a_\u2026 \u6216 amd-b_\u2026\uFF09\uFF0C\u8BF7\u6838\u5BF9\u540E\u91CD\u8BD5",
+      "CREDENTIAL_MALFORMED"
+    );
   }
   return serializeForInstance(contractInstanceId, async () => {
     const tokenHash = await hashCredential(params.token);
@@ -404,18 +476,24 @@ async function respondAmendmentTx(db, params) {
       const versionStore = tx.objectStore("versions");
       const amendment = await amendmentStore.get(params.amendmentId);
       if (!amendment) {
-        throw new AmendmentError("\u53D8\u66F4\u8BB0\u5F55\u4E0D\u5B58\u5728");
+        throw new AmendmentError("\u53D8\u66F4\u8BB0\u5F55\u4E0D\u5B58\u5728", "NOT_FOUND");
       }
       if (isTerminal(amendment.status)) {
-        throw new AmendmentError(`\u53D8\u66F4\u5DF2${amendment.status === "applied" ? "\u751F\u6548" : "\u64A4\u56DE"}\uFF0C\u64CD\u4F5C\u65E0\u6548`);
+        throw new AmendmentError(
+          `\u53D8\u66F4\u5DF2${amendment.status === "applied" ? "\u751F\u6548" : "\u64A4\u56DE"}\uFF0C\u51ED\u636E\u64CD\u4F5C\u4E0D\u518D\u6709\u6548`,
+          "TERMINAL_STATE"
+        );
       }
       const party = partyFromToken;
       const slot = amendment.credentials[party];
       if (!slot) {
-        throw new CredentialVerificationError("\u8BE5\u51ED\u636E\u4E0D\u5C5E\u4E8E\u672C\u53D8\u66F4\u7684\u4EFB\u4F55\u4E00\u65B9");
+        throw new CredentialVerificationError("\u51ED\u636E\u6821\u9A8C\u5931\u8D25\uFF1A\u8BE5\u51ED\u636E\u4E0D\u5C5E\u4E8E\u672C\u53D8\u66F4\u7684\u4EFB\u4F55\u4E00\u65B9", "CREDENTIAL_MISMATCH");
       }
       if (!timingSafeEqual(tokenHash, slot.tokenHash)) {
-        throw new CredentialVerificationError("\u51ED\u636E\u6821\u9A8C\u5931\u8D25\uFF1A\u4E0E\u672C\u53D8\u66F4\u767B\u8BB0\u65F6\u5206\u53D1\u7684\u51ED\u636E\u4E0D\u5339\u914D");
+        throw new CredentialVerificationError(
+          "\u51ED\u636E\u6821\u9A8C\u5931\u8D25\uFF1A\u4E0E\u672C\u53D8\u66F4\u767B\u8BB0\u65F6\u5206\u53D1\u7684\u51ED\u636E\u4E0D\u5339\u914D\uFF08\u53EF\u80FD\u662F\u8DE8\u53D8\u66F4\u590D\u7528\u3001\u4ED6\u65B9\u51ED\u636E\u6216\u8F93\u5165\u6709\u8BEF\uFF09\uFF0C\u672C\u6B21\u64CD\u4F5C\u672A\u751F\u6548",
+          "CREDENTIAL_MISMATCH"
+        );
       }
       const now = nowIso();
       if (slot.used) {
@@ -462,7 +540,7 @@ async function respondAmendmentTx(db, params) {
       return { amendment: applied, applied: true, party, version, instance: nextInstance };
     } catch (error) {
       tx.abort();
-      throw error;
+      throw asPersistenceFailure(error);
     }
   });
 }
@@ -692,7 +770,19 @@ test("\u51ED\u636E\u5B89\u5168\uFF1A\u683C\u5F0F\u9519\u8BEF\u3001\u54C8\u5E0C\u
     // 换前缀冒充甲方
   ];
   for (const bad of badInputs) {
-    await assert.rejects(confirmA(db, amendment.id, bad), CredentialVerificationError, `\u5E94\u6536\u4E0B\u9519\u7968: ${bad}`);
+    const expected = bad === "not-a-token" ? "CREDENTIAL_MALFORMED" : "CREDENTIAL_MISMATCH";
+    await assert.rejects(
+      async () => {
+        try {
+          await confirmA(db, amendment.id, bad);
+        } catch (error) {
+          assert.equal(error.code, expected, `\u9519\u7968\u5E94\u5F52\u7C7B\u4E3A ${expected}: ${bad}`);
+          throw error;
+        }
+      },
+      CredentialVerificationError,
+      `\u5E94\u6536\u4E0B\u9519\u7968: ${bad}`
+    );
   }
   const amdAfter = await db.get("amendments", amendment.id);
   assert.equal(amdAfter.status, "pending" /* Pending */);
@@ -733,12 +823,20 @@ test("\u51ED\u636E\u5B89\u5168\uFF1A\u6301\u7968\u64A4\u56DE\u4E00\u6B21\u6027\u
   const w = await withdraw(db, amendment.id, tokenB);
   assert.equal(w.amendment.status, "withdrawn" /* Withdrawn */);
   assert.equal(w.amendment.credentials["partyB" /* PartyB */].usedFor, "withdraw");
-  await assert.rejects(withdraw(db, amendment.id, tokenB), AmendmentError);
-  await assert.rejects(confirmB(db, amendment.id, tokenB), AmendmentError);
-  await assert.rejects(confirmA(db, amendment.id, tokenA), AmendmentError);
+  await assertTerminalRejection(withdraw(db, amendment.id, tokenB));
+  await assertTerminalRejection(confirmB(db, amendment.id, tokenB));
+  await assertTerminalRejection(confirmA(db, amendment.id, tokenA));
   assert.equal((await db.get("instances", inst.id)).finalHtml, V1_HTML);
   assert.deepEqual(await db.getAllFromIndex("versions", "byInstance", inst.id), []);
 });
+async function assertTerminalRejection(promise) {
+  await assert.rejects(
+    promise.then(() => {
+      throw new Error("\u672C\u5E94\u62D2\u7EDD");
+    }),
+    (error) => error instanceof AmendmentError && error.code === "TERMINAL_STATE"
+  );
+}
 test("\u6B63\u5E38\u6D41\u7A0B\uFF1A\u53CC\u65B9\u5404\u51ED\u5408\u6CD5\u7968\u786E\u8BA4\u4E00\u6B21\u540E\uFF0C\u540C\u4E8B\u52A1\u751F\u6210\u65B0\u7248\u672C\u5E76\u66FF\u6362\u6B63\u6587", async () => {
   await resetDb();
   const db = await openFreshDb();
@@ -819,6 +917,81 @@ test("\u56DE\u6EDA\uFF1A\u53CC\u65B9\u786E\u8BA4\u9F50\u5907\u4F46\u843D\u5E93\u
   assert.equal(amdAfter.credentials["partyA" /* PartyA */].used, true);
   assert.equal(amdAfter.credentials["partyB" /* PartyB */].used, false, "\u4E59\u65B9\u786E\u8BA4\u4E0D\u843D\u5E93");
   assert.deepEqual(await db.getAll("versions"), []);
+  await db.put("instances", inst);
+  const retry = await confirmB(db, amendment.id, tokenB);
+  assert.equal(retry.applied, true, "\u5931\u8D25\u540E\u5408\u6CD5\u51ED\u636E\u4ECD\u53EF\u5B8C\u6210\u786E\u8BA4");
+  const amdRetry = await db.get("amendments", amendment.id);
+  assert.equal(amdRetry.status, "applied" /* Applied */);
+  assert.equal((await db.get("instances", inst.id)).finalHtml, V2_HTML);
+});
+test("\u56DE\u6EDA\uFF1A\u771F\u6B63\u7684\u5199\u5165\u5931\u8D25\u5F52\u7C7B\u4E3A PERSISTENCE_FAILED\uFF0C\u56DE\u6EDA\u540E\u51ED\u636E\u4ECD\u53EF\u7528", async () => {
+  await resetDb();
+  const db = await openFreshDb();
+  const inst = await seedSignedContract(db);
+  const { amendment, tokenA, tokenB } = await registerHelper(db, inst);
+  await confirmA(db, amendment.id, tokenA);
+  const failingDb = proxyNextPutFailure(db, "versions", new Error("disk full"));
+  const error = await confirmB(failingDb, amendment.id, tokenB).then(
+    () => null,
+    (reason) => reason
+  );
+  assert.ok(error instanceof AmendmentError, "\u5E94\u5305\u88C5\u4E3A AmendmentError");
+  assert.equal(error.code, "PERSISTENCE_FAILED");
+  const amdAfter = await db.get("amendments", amendment.id);
+  assert.equal(amdAfter.status, "pending" /* Pending */);
+  assert.equal(amdAfter.credentials["partyB" /* PartyB */].used, false);
+  assert.deepEqual(await db.getAllFromIndex("versions", "byInstance", inst.id), []);
+  assert.equal((await db.get("instances", inst.id)).finalHtml, V1_HTML);
+  const retry = await confirmB(db, amendment.id, tokenB);
+  assert.equal(retry.applied, true);
+  assert.equal((await db.get("instances", inst.id)).finalHtml, V2_HTML);
+});
+function proxyNextPutFailure(db, storeName, failure) {
+  let armed = true;
+  const wrapStore = (store) => new Proxy(store, {
+    get(target, prop) {
+      if (prop === "put" && armed) {
+        return (..._args) => {
+          armed = false;
+          throw failure;
+        };
+      }
+      const value = Reflect.get(target, prop);
+      return typeof value === "function" ? value.bind(target) : value;
+    }
+  });
+  return new Proxy(db, {
+    get(target, prop, receiver) {
+      if (prop !== "transaction") {
+        return Reflect.get(target, prop, receiver);
+      }
+      return (...args) => {
+        const tx = Reflect.apply(target.transaction, target, args);
+        if (tx.mode !== "readwrite") {
+          return tx;
+        }
+        return new Proxy(tx, {
+          get(txTarget, txProp, txReceiver) {
+            if (txProp !== "objectStore") {
+              const value = Reflect.get(txTarget, txProp, txReceiver);
+              return typeof value === "function" ? value.bind(txTarget) : value;
+            }
+            return (name) => {
+              const store = Reflect.apply(txTarget.objectStore, txTarget, [name]);
+              return name === storeName ? wrapStore(store) : store;
+            };
+          }
+        });
+      };
+    }
+  });
+}
+test("\u53CD\u9988\u5206\u7C7B\uFF1AclassifyCredentialError \u80FD\u533A\u5206\u51ED\u636E/\u7EC8\u6001/\u843D\u5E93\u5931\u8D25", async () => {
+  const { classifyCredentialError: classifyCredentialError2 } = await Promise.resolve().then(() => (init_amendmentFeedback(), amendmentFeedback_exports));
+  assert.equal(classifyCredentialError2(new CredentialVerificationError("x", "CREDENTIAL_MALFORMED")).reason, "CREDENTIAL_MALFORMED");
+  assert.equal(classifyCredentialError2(new AmendmentError("\u5DF2\u751F\u6548", "TERMINAL_STATE")).reason, "TERMINAL_STATE");
+  assert.equal(classifyCredentialError2(new Error("boom")).reason, "PERSISTENCE_FAILED");
+  assert.equal(classifyCredentialError2("string-error").reason, "PERSISTENCE_FAILED");
 });
 test("\u56DE\u8BFB\uFF1A\u751F\u6548\u540E\u91CD\u5F00\u6570\u636E\u5E93\uFF0C\u51ED\u636E\u72B6\u6001/\u6B63\u6587/\u7248\u672C\u4E00\u81F4", async () => {
   await resetDb();
