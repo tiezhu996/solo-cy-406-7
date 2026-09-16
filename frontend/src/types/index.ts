@@ -1,3 +1,4 @@
+export * from './amendment';
 export * from './clause';
 export * from './contract-instance';
 export * from './enums';

@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "vite --host 0.0.0.0",
     "build": "tsc --noEmit && vite build",
-    "preview": "vite preview --host 0.0.0.0 --port 28312"
+    "preview": "vite preview --host 0.0.0.0 --port 28312",
+    "test:amendments": "esbuild scripts/amendment.test.ts --bundle --platform=node --format=esm --packages=external --outfile=scripts/.amendment.test.mjs && node --test scripts/.amendment.test.mjs"
   },
   "dependencies": {
     "@arco-design/web-react": "^2.66.6",
@@ -25,6 +26,7 @@
     "@types/react": "^18.3.23",
     "@types/react-dom": "^18.3.7",
     "@vitejs/plugin-react": "^4.6.0",
+    "fake-indexeddb": "^6.2.5",
     "typescript": "^5.8.3",
     "vite": "^5.4.19"
   }

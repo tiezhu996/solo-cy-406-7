@@ -11,6 +11,9 @@
 - 条款库：按分类管理违约、争议解决、付款、知识产权等常用条款。
 - 本地持久化：通过 IndexedDB 保存全部数据，并支持 JSON 导入导出。
 - Undo/Redo：模板编辑器集成 Ctrl+Z / Ctrl+Y，并在状态管理中维护模板历史栈。
+- 合同变更确认：仅对「已签署」合同开放**唯一登记入口**；登记后原合同继续有效，
+  变更停在双方确认阶段，同一方重复确认幂等不生效，任一方撤回则整条变更失效；
+  双方确认后在同一 IndexedDB 事务内生成新版本并替换当前正文，任一步失败整体回滚。
 
 ## 快速启动
 
@@ -29,6 +32,29 @@ npm run build
 npm run preview
 ```
 
+变更模块逻辑测试（纯状态机 + fake-indexeddb 真实事务，含并发赛跑与回滚用例）：
+
+```bash
+npm run test:amendments
+```
+
+## 合同变更确认模块
+
+规则与一致性保证：
+
+1. **唯一登记入口**：只有已签署合同实例页上的「登记变更」按钮可以创建变更；
+   已签署合同的变量、正文与状态编辑被冻结。
+2. **原合同继续有效**：登记后变更停在「待双方确认」，确认完成前合同正文不动。
+3. **双方确认**：甲方、乙方分别确认；同一方重复确认为幂等操作，只留审计轨迹。
+4. **撤回即失效**：待确认阶段任一方撤回，整条变更进入终态「已撤回」，已确认进度作废。
+5. **生效原子性**：第二方确认齐备时，`新版本写入 + 正文替换 + 变更记录推进`
+   在同一个 IndexedDB `readwrite` 事务内完成；生成新版本失败（或任何一步出错）时
+   事务 abort，**合同正文、变更记录、版本号三者一起保持不变**。
+6. **并发安全**：同一份合同的登记/确认/撤回通过 per-instance Promise 队列串行化，
+   确认与撤回同时到达时只会落地一个终态，不会出现「已撤回却已生成新版本」。
+7. **刷新一致**：全部状态落盘 IndexedDB（amendments store），内存缓存仅在事务提交
+   成功后更新，刷新后以数据库回读为准。
+
 ## 技术栈
 
 | 类别 | 技术 |
@@ -41,23 +67,32 @@ npm run preview
 | 本地数据库 | IndexedDB + idb |
 | 差异对比 | diff |
 | 路由 | React Router |
+| 逻辑测试 | node:test + fake-indexeddb（仅 devDependency） |
 
 ## 目录结构
 
 ```text
-frontend/src/
-├── api/           # IndexedDB 数据访问入口
-├── stores/        # template.ts, clause.ts, instance.ts, version.ts
-├── types/         # Template / Clause / ContractInstance / Version / enums
-├── components/
-│   ├── common/    # TemplateCard, RichEditor, VariableForm, CategoryFilter, VersionDiff
-│   ├── editor/    # 变量面板、条款抽屉、条款编辑器、编辑器工具栏
-│   └── preview/   # 合同预览组件
-├── hooks/         # useIndexedDB, useHistory, useVariableReplace
-├── pages/         # TemplateList, TemplateEditor, InstanceEditor, VersionCompare, ClauseList
-├── router/        # 路由和应用布局
-├── styles/        # 全局样式
-└── utils/         # db, diff, export, seed
+frontend/
+├── scripts/
+│   └── amendment.test.ts        # 变更状态机/事务/并发/回滚/回读测试
+└── src/
+    ├── api/           # IndexedDB 数据访问入口
+    ├── stores/        # template.ts, clause.ts, instance.ts, version.ts, amendment.ts
+    ├── types/         # Template / Clause / ContractInstance / Version / Amendment / enums
+    ├── components/
+    │   ├── common/    # TemplateCard, RichEditor, VariableForm, CategoryFilter, VersionDiff
+    │   ├── amendment/ # AmendmentPanel（确认/撤回/时间线）、RegisterAmendmentModal（唯一登记入口）
+    │   ├── editor/    # 变量面板、条款抽屉、条款编辑器、编辑器工具栏
+    │   └── preview/   # 合同预览组件
+    ├── hooks/         # useIndexedDB, useHistory, useVariableReplace
+    ├── pages/         # TemplateList, TemplateEditor, InstanceEditor, VersionCompare, ClauseList
+    ├── router/        # 路由和应用布局
+    ├── styles/        # 全局样式
+    └── utils/
+        ├── db.ts                  # schema v2（含 amendments store 与 byInstance 索引）
+        ├── amendmentMachine.ts    # 纯函数变更状态机：登记/确认/撤回/生效
+        ├── amendmentTx.ts         # 单事务原子提交 + per-instance 串行锁
+        └── diff, export, seed
 ```
 
 ## License

@@ -1,6 +1,7 @@
+import { Amendment, AmendmentAction, AmendmentStatus } from '../types/amendment';
 import { Clause } from '../types/clause';
 import { ContractInstance } from '../types/contract-instance';
-import { ClauseCategory, ContractStatus, TemplateCategory, VariableType } from '../types/enums';
+import { ClauseCategory, ContractParty, ContractStatus, TemplateCategory, VariableType } from '../types/enums';
 import { Template } from '../types/template';
 import { Version } from '../types/version';
 import { makeId, nowIso } from './db';
@@ -74,12 +75,64 @@ export const seedClauses: Clause[] = [
   }
 ];
 
-export const seedInstances: ContractInstance[] = [];
-export const seedVersions: Version[] = [];
+// —— 合同变更演示数据：一份已签署劳动合同（v1），配一条甲方已确认的待确认变更 ——
+
+const signedInstanceId = makeId('inst');
+const signedVersionId = makeId('ver');
+const pendingAmendmentId = makeId('amd');
+
+const signedInstanceHtml =
+  '<h2>劳动合同</h2><p>甲方：某某科技有限公司</p><p>乙方：张三</p><p>乙方自 2026-07-01 起入职甲方，月工资为人民币 15000 元。</p><p>双方应遵守劳动法律法规及公司制度。</p>';
+
+const signedInstance: ContractInstance = {
+  id: signedInstanceId,
+  templateId: seedTemplates[0].id,
+  title: '劳动合同（张三）',
+  variableValues: { partyA: '某某科技有限公司', partyB: '张三', salary: '15000', startDate: '2026-07-01' },
+  finalHtml: signedInstanceHtml,
+  status: ContractStatus.Signed,
+  versionIds: [signedVersionId],
+  createdAt,
+  updatedAt: createdAt
+};
+
+const signedVersion: Version = {
+  id: signedVersionId,
+  contractInstanceId: signedInstanceId,
+  versionNo: 1,
+  contentSnapshot: signedInstanceHtml,
+  variableSnapshot: { ...signedInstance.variableValues },
+  createdAt,
+  remark: '签署归档版本'
+};
+
+const pendingAmendmentHtml = signedInstanceHtml.replace('月工资为人民币 15000 元', '月工资为人民币 18000 元');
+
+const pendingAmendment: Amendment = {
+  id: pendingAmendmentId,
+  contractInstanceId: signedInstanceId,
+  title: '月薪调整为 18000 元',
+  reason: '年度调薪，双方口头协商一致，现走书面变更确认流程。',
+  proposedHtml: pendingAmendmentHtml,
+  status: AmendmentStatus.Pending,
+  confirmedParties: [ContractParty.PartyA],
+  proposedBy: ContractParty.PartyA,
+  proposedAt: createdAt,
+  updatedAt: createdAt,
+  timeline: [
+    { action: AmendmentAction.Created, party: ContractParty.PartyA, at: createdAt, detail: '月薪调整为 18000 元' },
+    { action: AmendmentAction.Confirmed, party: ContractParty.PartyA, at: createdAt }
+  ]
+};
+
+export const seedInstances: ContractInstance[] = [signedInstance];
+export const seedVersions: Version[] = [signedVersion];
+export const seedAmendments: Amendment[] = [pendingAmendment];
 
 export const seedData = {
   templates: seedTemplates,
   clauses: seedClauses,
   instances: seedInstances,
-  versions: seedVersions
+  versions: seedVersions,
+  amendments: seedAmendments
 };

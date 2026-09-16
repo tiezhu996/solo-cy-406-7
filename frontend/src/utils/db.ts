@@ -1,13 +1,19 @@
 import { openDB, IDBPDatabase } from 'idb';
+import { Amendment } from '../types/amendment';
 import { Clause } from '../types/clause';
 import { ContractInstance } from '../types/contract-instance';
 import { Template } from '../types/template';
 import { Version } from '../types/version';
 
 export const DB_NAME = 'contract-template-editor';
-export const DB_VERSION = 1;
+/**
+ * v1: templates / clauses / instances / versions
+ * v2: 新增 amendments（合同变更记录），并为 versions 增加 byInstance 索引，
+ *     供变更生效事务在同一事务内查询当前最大版本号。
+ */
+export const DB_VERSION = 2;
 
-export const STORE_NAMES = ['templates', 'clauses', 'instances', 'versions'] as const;
+export const STORE_NAMES = ['templates', 'clauses', 'instances', 'versions', 'amendments'] as const;
 export type StoreName = (typeof STORE_NAMES)[number];
 
 export interface StoreValueMap {
@@ -15,6 +21,7 @@ export interface StoreValueMap {
   clauses: Clause;
   instances: ContractInstance;
   versions: Version;
+  amendments: Amendment;
 }
 
 export type StoreValue<S extends StoreName> = StoreValueMap[S];
@@ -24,6 +31,7 @@ export interface ExportPayload {
   clauses: Clause[];
   instances: ContractInstance[];
   versions: Version[];
+  amendments: Amendment[];
   exportedAt: string;
 }
 
@@ -37,17 +45,35 @@ export function nowIso() {
   return new Date().toISOString();
 }
 
-export function getDb() {
-  if (!dbPromise) {
-    dbPromise = openDB(DB_NAME, DB_VERSION, {
-      upgrade(db) {
-        for (const storeName of STORE_NAMES) {
-          if (!db.objectStoreNames.contains(storeName)) {
-            db.createObjectStore(storeName, { keyPath: 'id' });
+/** 打开（或按版本迁移）应用数据库；getDb 在此之上做单例缓存 */
+export function openAppDb(): Promise<IDBPDatabase> {
+  return openDB(DB_NAME, DB_VERSION, {
+    upgrade(db, oldVersion, _newVersion, transaction) {
+      for (const storeName of STORE_NAMES) {
+        if (!db.objectStoreNames.contains(storeName)) {
+          const store = db.createObjectStore(storeName, { keyPath: 'id' });
+          // 全新建库时直接在同一升级事务内建好索引
+          if (storeName === 'versions' || storeName === 'amendments') {
+            store.createIndex('byInstance', 'contractInstanceId');
           }
         }
       }
-    });
+
+      // v1 -> v2：旧库中的 versions 需要补建 byInstance 索引；
+      // amendments 为新建 store，上面已带索引。
+      if (oldVersion > 0 && oldVersion < 2) {
+        const versions = transaction.objectStore('versions');
+        if (!versions.indexNames.contains('byInstance')) {
+          versions.createIndex('byInstance', 'contractInstanceId');
+        }
+      }
+    }
+  });
+}
+
+export function getDb() {
+  if (!dbPromise) {
+    dbPromise = openAppDb();
   }
 
   return dbPromise;
@@ -80,11 +106,12 @@ export async function clearStore(storeName: StoreName) {
 }
 
 export async function exportAllData(): Promise<ExportPayload> {
-  const [templates, clauses, instances, versions] = await Promise.all([
+  const [templates, clauses, instances, versions, amendments] = await Promise.all([
     getAllRecords('templates'),
     getAllRecords('clauses'),
     getAllRecords('instances'),
-    getAllRecords('versions')
+    getAllRecords('versions'),
+    getAllRecords('amendments')
   ]);
 
   return {
@@ -92,6 +119,7 @@ export async function exportAllData(): Promise<ExportPayload> {
     clauses,
     instances,
     versions,
+    amendments,
     exportedAt: nowIso()
   };
 }

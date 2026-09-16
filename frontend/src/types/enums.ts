@@ -1,3 +1,5 @@
+import type { AmendmentStatus } from './amendment';
+
 export enum TemplateCategory {
   Labor = 'labor',
   Lease = 'lease',
@@ -21,6 +23,17 @@ export enum ContractStatus {
   Finalized = 'finalized',
   Signed = 'signed'
 }
+
+/** 合同当事方：变更需要甲、乙双方分别确认 */
+export enum ContractParty {
+  PartyA = 'partyA',
+  PartyB = 'partyB'
+}
+
+export const CONTRACT_PARTY_LABELS: Record<ContractParty, string> = {
+  [ContractParty.PartyA]: '甲方',
+  [ContractParty.PartyB]: '乙方'
+};
 
 export enum VariableType {
   Text = 'text',
@@ -52,6 +65,12 @@ export const CONTRACT_STATUS_LABELS: Record<ContractStatus, string> = {
   [ContractStatus.Draft]: '草稿',
   [ContractStatus.Finalized]: '定稿',
   [ContractStatus.Signed]: '已签署'
+};
+
+export const AMENDMENT_STATUS_LABELS: Record<AmendmentStatus, string> = {
+  pending: '待双方确认',
+  applied: '已生效',
+  withdrawn: '已撤回'
 };
 
 export const VARIABLE_TYPE_LABELS: Record<VariableType, string> = {

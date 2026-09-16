@@ -31,3 +31,4 @@ export const templateDb = createStoreApi('templates');
 export const clauseDb = createStoreApi('clauses');
 export const instanceDb = createStoreApi('instances');
 export const versionDb = createStoreApi('versions');
+export const amendmentDb = createStoreApi('amendments');

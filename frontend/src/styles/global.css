@@ -410,3 +410,72 @@ body {
     padding: 18px;
   }
 }
+
+/* ===== 合同变更确认模块 ===== */
+
+.signed-freeze-banner {
+  margin-bottom: 18px;
+}
+
+.amendment-section {
+  margin-top: 22px;
+}
+
+.amendment-panel {
+  width: 100%;
+}
+
+.amendment-pending-card {
+  border-color: #f3d9b6;
+  background: #fffaf2;
+}
+
+.amendment-pending-card .arco-card-body {
+  padding: 16px 18px;
+}
+
+.amendment-party-picker {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
+}
+
+.amendment-proposed {
+  max-height: 320px;
+  min-height: 0;
+  padding: 18px 24px;
+  overflow-y: auto;
+  border: 1px dashed var(--line);
+  background: #fffdf8;
+}
+
+.amendment-form .rich-editor {
+  border: 1px solid var(--line);
+  border-radius: 4px;
+}
+
+.amendment-history-entry {
+  width: 100%;
+}
+
+.amendment-history-meta,
+.amendment-trail {
+  font-size: 12px;
+}
+
+.amendment-trail {
+  display: block;
+}
+
+.instance-overview {
+  margin-top: 36px;
+}
+
+.instance-overview-heading {
+  margin-bottom: 12px;
+}
+
+.instance-overview-heading h5 {
+  margin: 0 0 2px;
+}
